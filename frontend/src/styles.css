@@ -118,7 +118,7 @@ label {
   color: #526173;
   display: grid;
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 500;
   gap: 6px;
   min-width: 0;
 }
@@ -149,6 +149,18 @@ select {
   gap: 10px;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   min-width: 0;
+}
+
+.date-filter {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.date-filter > span {
+  color: #526173;
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .primary-button {
@@ -524,6 +536,35 @@ dd {
   color: #6a7888;
   font-size: 12px;
   margin: -6px 0 12px;
+}
+
+.pagination {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr auto 1fr;
+  margin-bottom: 10px;
+}
+
+.pagination button {
+  background: #f8fafc;
+  border: 1px solid #d9e1e8;
+  border-radius: 8px;
+  color: #526173;
+  font-size: 12px;
+  font-weight: 800;
+  min-height: 32px;
+}
+
+.pagination button:disabled {
+  color: #a8b3c0;
+  cursor: not-allowed;
+}
+
+.pagination span {
+  color: #6a7888;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .status-row {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated
 from pathlib import Path
 
@@ -80,6 +81,8 @@ def create_app() -> FastAPI:
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
     ):
+        parsed_date_from = parse_query_datetime(date_from, end_of_day=False)
+        parsed_date_to = parse_query_datetime(date_to, end_of_day=True)
         async with connection() as conn:
             total = await count_datasets(
                 conn,
@@ -88,8 +91,8 @@ def create_app() -> FastAPI:
                 dataset_type=dataset_type,
                 platform=platform,
                 sensor=sensor,
-                date_from=date_from,
-                date_to=date_to,
+                date_from=parsed_date_from,
+                date_to=parsed_date_to,
                 province=province,
                 kabupaten=kabupaten,
                 kecamatan=kecamatan,
@@ -102,8 +105,8 @@ def create_app() -> FastAPI:
                 dataset_type=dataset_type,
                 platform=platform,
                 sensor=sensor,
-                date_from=date_from,
-                date_to=date_to,
+                date_from=parsed_date_from,
+                date_to=parsed_date_to,
                 province=province,
                 kabupaten=kabupaten,
                 kecamatan=kecamatan,
@@ -117,8 +120,8 @@ def create_app() -> FastAPI:
                 dataset_type=dataset_type,
                 platform=platform,
                 sensor=sensor,
-                date_from=date_from,
-                date_to=date_to,
+                date_from=parsed_date_from,
+                date_to=parsed_date_to,
                 province=province,
                 kabupaten=kabupaten,
                 kecamatan=kecamatan,
@@ -390,6 +393,23 @@ def to_odc_dataset(item: dict) -> dict:
 
 def iso(value):
     return value.isoformat() if value else None
+
+
+def parse_query_datetime(value: str | None, *, end_of_day: bool = False) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) == 10:
+        suffix = "T23:59:59" if end_of_day else "T00:00:00"
+        text = f"{text}{suffix}"
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 app = create_app()

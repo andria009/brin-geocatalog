@@ -22,14 +22,18 @@ export type DatasetFilters = {
   bbox?: number[];
 };
 
-export async function getDatasets(filters: DatasetFilters, limit = 1000): Promise<DatasetResponse> {
-  const params = new URLSearchParams({ limit: String(limit) });
+export async function getDatasets(
+  filters: DatasetFilters,
+  limit = 100,
+  offset = 0
+): Promise<DatasetResponse> {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
   append(params, "q", filters.q);
   append(params, "dataset_type", filters.datasetType);
   append(params, "platform", filters.platform);
   append(params, "sensor", filters.sensor);
-  append(params, "date_from", filters.dateFrom);
-  append(params, "date_to", filters.dateTo);
+  append(params, "date_from", startOfDay(filters.dateFrom));
+  append(params, "date_to", endOfDay(filters.dateTo));
   append(params, "province", filters.province);
   append(params, "kabupaten", filters.kabupaten);
   append(params, "kecamatan", filters.kecamatan);
@@ -39,7 +43,7 @@ export async function getDatasets(filters: DatasetFilters, limit = 1000): Promis
     total: 0,
     footprint_total: 0,
     limit,
-    offset: 0
+    offset
   });
 }
 
@@ -91,4 +95,12 @@ function append(params: URLSearchParams, key: string, value: string) {
   if (trimmed) {
     params.append(key, trimmed);
   }
+}
+
+function startOfDay(value: string) {
+  return value.trim() ? `${value.trim()}T00:00:00` : "";
+}
+
+function endOfDay(value: string) {
+  return value.trim() ? `${value.trim()}T23:59:59` : "";
 }

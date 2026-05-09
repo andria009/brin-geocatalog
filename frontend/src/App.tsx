@@ -32,17 +32,22 @@ import type { Dataset, LocationOptions, PlatformStatus, ScanRun, SourceFile } fr
 
 type Basemap = "street" | "satellite";
 type RightRailMode = "details" | "datasets" | null;
+const MAX_MAP_RECORDS = 1000;
+const DATASET_PAGE_SIZE = 100;
 
 export default function App() {
   const mapRef = useRef<maplibregl.Map | null>(null);
   const mapNodeRef = useRef<HTMLDivElement | null>(null);
-  const datasetsRef = useRef<Dataset[]>([]);
+  const mapDatasetsRef = useRef<Dataset[]>([]);
   const filtersRef = useRef<DatasetFilters | null>(null);
   const selectAreaModeRef = useRef(false);
   const dragStartRef = useRef<maplibregl.LngLat | null>(null);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [mapDatasets, setMapDatasets] = useState<Dataset[]>([]);
   const [totalDatasets, setTotalDatasets] = useState(0);
-  const [totalFootprints, setTotalFootprints] = useState(0);
+  const [datasetPage, setDatasetPage] = useState(0);
+  const [catalogSearched, setCatalogSearched] = useState(false);
+  const [appliedFilters, setAppliedFilters] = useState<DatasetFilters | null>(null);
   const [platforms, setPlatforms] = useState<PlatformStatus[]>([]);
   const [runs, setRuns] = useState<ScanRun[]>([]);
   const [sources, setSources] = useState<SourceFile[]>([]);
@@ -75,14 +80,17 @@ export default function App() {
   });
 
   const loadedFootprintCount = useMemo(
-    () => datasets.filter((item) => item.bbox && item.bbox.length === 4).length,
-    [datasets]
+    () => mapDatasets.filter((item) => item.bbox && item.bbox.length === 4).length,
+    [mapDatasets]
   );
   const platformNames = useMemo(() => platforms.map((item) => item.platform), [platforms]);
   const areaFilter = kecamatan || kabupaten || province;
   const activeFilterLabel = [areaFilter, filters.platform, filters.datasetType]
     .filter(Boolean)
     .join(" / ");
+  const hasDatasetFilter = hasActiveDatasetFilter(filters);
+  const tooManyRecords = catalogSearched && totalDatasets >= MAX_MAP_RECORDS;
+  const totalDatasetPages = Math.max(1, Math.ceil(totalDatasets / DATASET_PAGE_SIZE));
 
   useEffect(() => {
     filtersRef.current = filters;
@@ -205,7 +213,7 @@ export default function App() {
       });
       mapRef.current?.on("click", "dataset-fill", (event) => {
         const id = event.features?.[0]?.properties?.id;
-        const match = datasetsRef.current.find((item) => item.id === id);
+        const match = mapDatasetsRef.current.find((item) => item.id === id);
         if (match) {
           selectDataset(match, false);
         }
@@ -249,7 +257,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    void refreshAll();
+    void refreshDashboard();
   }, []);
 
   useEffect(() => {
@@ -289,12 +297,12 @@ export default function App() {
   }, [basemap]);
 
   useEffect(() => {
-    datasetsRef.current = datasets;
+    mapDatasetsRef.current = mapDatasets;
     const source = mapRef.current?.getSource("dataset-footprints") as
       | maplibregl.GeoJSONSource
       | undefined;
-    source?.setData(toFootprintCollection(datasets));
-  }, [datasets]);
+    source?.setData(toFootprintCollection(mapDatasets));
+  }, [mapDatasets]);
 
   useEffect(() => {
     const source = mapRef.current?.getSource("selected-boundary") as
@@ -329,23 +337,62 @@ export default function App() {
     }
   }
 
-  async function refreshAll(nextFilters = filters) {
+  async function refreshDashboard() {
     setLoading(true);
     setLoadError("");
     try {
-      const [datasetResponse, platformRows, runRows, sourceRows] = await Promise.all([
-        getDatasets(nextFilters),
+      const [countResponse, platformRows, runRows, sourceRows] = await Promise.all([
+        getDatasets(filters, 1, 0),
         getPlatforms(),
         getRuns(),
         getSourceFiles()
       ]);
-      setDatasets(datasetResponse.items);
-      setTotalDatasets(datasetResponse.total);
-      setTotalFootprints(datasetResponse.footprint_total);
+      setTotalDatasets(countResponse.total);
+      setDatasets([]);
+      setMapDatasets([]);
       setSelected(null);
       setPlatforms(platformRows);
       setRuns(runRows);
       setSources(sourceRows);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Catalog data failed to load.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshAll(nextFilters = filters) {
+    await refreshCatalogPage(nextFilters, 0);
+  }
+
+  async function refreshCatalogPage(nextFilters = filters, page = datasetPage) {
+    setCatalogSearched(true);
+    setAppliedFilters(nextFilters);
+    setLoading(true);
+    setLoadError("");
+    setSelected(null);
+    try {
+      const active = hasActiveDatasetFilter(nextFilters);
+      const offset = page * DATASET_PAGE_SIZE;
+      const [datasetResponse, platformRows, runRows, sourceRows] = await Promise.all([
+        active ? getDatasets(nextFilters, DATASET_PAGE_SIZE, offset) : getDatasets(nextFilters, 1, 0),
+        getPlatforms(),
+        getRuns(),
+        getSourceFiles()
+      ]);
+      setTotalDatasets(datasetResponse.total);
+      setDatasetPage(active ? page : 0);
+      setDatasets(active ? datasetResponse.items : []);
+      setPlatforms(platformRows);
+      setRuns(runRows);
+      setSources(sourceRows);
+
+      if (active && datasetResponse.total < MAX_MAP_RECORDS) {
+        const mapResponse = await getDatasets(nextFilters, MAX_MAP_RECORDS, 0);
+        setMapDatasets(mapResponse.items);
+      } else {
+        setMapDatasets([]);
+      }
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : "Catalog data failed to load.");
     } finally {
@@ -391,7 +438,7 @@ export default function App() {
   }
 
   function downloadVisibleGeoJson() {
-    const collection = toFootprintCollection(datasets);
+    const collection = toFootprintCollection(mapDatasets);
     const blob = new Blob([JSON.stringify(collection, null, 2)], {
       type: "application/geo+json"
     });
@@ -427,6 +474,64 @@ export default function App() {
                 placeholder="Filename, product, satellite"
               />
             </label>
+            <label>
+              Platform
+              <input
+                list="platform-options"
+                value={filters.platform}
+                onChange={(event) => setFilters({ ...filters, platform: event.target.value })}
+                placeholder="All platforms"
+              />
+              <datalist id="platform-options">
+                {platformNames.map((platform) => (
+                  <option key={platform} value={platform === "unknown" ? "" : platform} />
+                ))}
+              </datalist>
+            </label>
+            <div className="field-grid">
+              <label>
+                Type
+                <input
+                  list="type-options"
+                  value={filters.datasetType}
+                  onChange={(event) => setFilters({ ...filters, datasetType: event.target.value })}
+                  placeholder="Any"
+                />
+                <datalist id="type-options">
+                  <option value="raster" />
+                  <option value="vector" />
+                </datalist>
+              </label>
+              <label>
+                Sensor
+                <input
+                  value={filters.sensor}
+                  onChange={(event) => setFilters({ ...filters, sensor: event.target.value })}
+                  placeholder="viirs, modis, msi"
+                />
+              </label>
+            </div>
+            <div className="date-filter">
+              <span>Date</span>
+              <div className="field-grid">
+                <label>
+                  From
+                  <input
+                    type="date"
+                    value={filters.dateFrom}
+                    onChange={(event) => setFilters({ ...filters, dateFrom: event.target.value })}
+                  />
+                </label>
+                <label>
+                  To
+                  <input
+                    type="date"
+                    value={filters.dateTo}
+                    onChange={(event) => setFilters({ ...filters, dateTo: event.target.value })}
+                  />
+                </label>
+              </div>
+            </div>
             <label>
               Provinsi
               <input
@@ -475,43 +580,6 @@ export default function App() {
                 </datalist>
               ) : null}
             </label>
-            <label>
-              Platform
-              <input
-                list="platform-options"
-                value={filters.platform}
-                onChange={(event) => setFilters({ ...filters, platform: event.target.value })}
-                placeholder="All platforms"
-              />
-              <datalist id="platform-options">
-                {platformNames.map((platform) => (
-                  <option key={platform} value={platform === "unknown" ? "" : platform} />
-                ))}
-              </datalist>
-            </label>
-            <div className="field-grid">
-              <label>
-                Type
-                <input
-                  list="type-options"
-                  value={filters.datasetType}
-                  onChange={(event) => setFilters({ ...filters, datasetType: event.target.value })}
-                  placeholder="Any"
-                />
-                <datalist id="type-options">
-                  <option value="raster" />
-                  <option value="vector" />
-                </datalist>
-              </label>
-              <label>
-                Sensor
-                <input
-                  value={filters.sensor}
-                  onChange={(event) => setFilters({ ...filters, sensor: event.target.value })}
-                  placeholder="viirs, modis, msi"
-                />
-              </label>
-            </div>
             <button className="primary-button" onClick={() => void refreshAll()}>
               <RefreshCw size={16} /> Refresh Catalog
             </button>
@@ -522,7 +590,7 @@ export default function App() {
       <section className="map-stage">
         <div className="map-toolbar">
           <div className="toolbar-count">
-            <strong>{formatNumber(totalFootprints)}</strong>
+            <strong>{formatNumber(totalDatasets)}</strong>
             <span>records</span>
           </div>
           <div className="basemap-switch" aria-label="Basemap">
@@ -569,7 +637,34 @@ export default function App() {
             GeoJSON
           </button>
         </div>
-        {totalDatasets > 0 && loadedFootprintCount === 0 ? (
+        {!catalogSearched ? (
+          <div className="map-notice">
+            <strong>Make a filter to show footprints</strong>
+            <span>
+              {formatNumber(totalDatasets)} records are available. Add a filter and refresh the catalog to
+              reduce records before footprints are drawn on the map.
+            </span>
+          </div>
+        ) : null}
+        {catalogSearched && !hasDatasetFilter ? (
+          <div className="map-notice">
+            <strong>Add a filter and refresh</strong>
+            <span>
+              Footprints stay hidden until a filter reduces the catalog. Select an area, platform, text, or
+              administrative filter, then refresh the catalog.
+            </span>
+          </div>
+        ) : null}
+        {tooManyRecords ? (
+          <div className="map-notice">
+            <strong>{formatNumber(totalDatasets)} matching records</strong>
+            <span>
+              The map shows footprints only when fewer than {formatNumber(MAX_MAP_RECORDS)} records match.
+              Make the filter more specific and refresh the catalog.
+            </span>
+          </div>
+        ) : null}
+        {catalogSearched && hasDatasetFilter && totalDatasets > 0 && loadedFootprintCount === 0 && !tooManyRecords ? (
           <div className="map-notice">
             <strong>{formatNumber(totalDatasets)} matching catalog records</strong>
             <span>
@@ -578,7 +673,7 @@ export default function App() {
             </span>
           </div>
         ) : null}
-        {totalDatasets === 0 && areaFilter ? (
+        {catalogSearched && hasDatasetFilter && totalDatasets === 0 ? (
           <div className="map-notice">
             <strong>No footprint-matched records</strong>
             <span>
@@ -672,8 +767,40 @@ export default function App() {
               <List size={16} /> Datasets
             </div>
             <p className="rail-summary">
-              Showing {formatNumber(datasets.length)} of {formatNumber(totalFootprints)} matching records.
+              {catalogSearched && hasDatasetFilter
+                ? `Showing ${formatNumber(datasets.length)} of ${formatNumber(
+                    totalDatasets
+                  )} matching records. Page ${formatNumber(datasetPage + 1)} of ${formatNumber(
+                    totalDatasetPages
+                  )}.`
+                : "Add a filter and refresh the catalog to list datasets."}
             </p>
+            {catalogSearched && hasDatasetFilter ? (
+              <div className="pagination">
+                <button
+                  disabled={datasetPage <= 0}
+                  onClick={() =>
+                    void refreshCatalogPage(appliedFilters ?? filters, Math.max(0, datasetPage - 1))
+                  }
+                >
+                  Previous
+                </button>
+                <span>
+                  {formatNumber(datasetPage + 1)} / {formatNumber(totalDatasetPages)}
+                </span>
+                <button
+                  disabled={datasetPage + 1 >= totalDatasetPages}
+                  onClick={() =>
+                    void refreshCatalogPage(
+                      appliedFilters ?? filters,
+                      Math.min(totalDatasetPages - 1, datasetPage + 1)
+                    )
+                  }
+                >
+                  Next
+                </button>
+              </div>
+            ) : null}
             <div className="dataset-list">
               {datasets.map((item) => (
                 <button
@@ -736,6 +863,8 @@ function DatasetInspector({ selected, onClose }: { selected: Dataset; onClose: (
           <dd>{selected.file_name}</dd>
           <dt>Size</dt>
           <dd>{formatBytes(selected.file_size_bytes)}</dd>
+          <dt>Acquired</dt>
+          <dd>{formatDateTime(selected.acquisition_start)}</dd>
           <dt>Modified</dt>
           <dd>{formatDateTime(selected.modified_at)}</dd>
           <dt>BBox</dt>
@@ -831,6 +960,21 @@ function visitNestedCoordinates(value: unknown, callback: (coordinate: GeoJSON.P
 
 function formatNumber(value: number | null | undefined) {
   return Number(value ?? 0).toLocaleString();
+}
+
+function hasActiveDatasetFilter(filters: DatasetFilters) {
+  return Boolean(
+    filters.q.trim() ||
+      filters.datasetType.trim() ||
+      filters.platform.trim() ||
+      filters.sensor.trim() ||
+      filters.dateFrom.trim() ||
+      filters.dateTo.trim() ||
+      filters.province.trim() ||
+      filters.kabupaten.trim() ||
+      filters.kecamatan.trim() ||
+      filters.bbox?.length
+  );
 }
 
 function formatDateTime(value: string | null | undefined) {

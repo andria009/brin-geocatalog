@@ -208,9 +208,15 @@ async def search_datasets(
     if sensor:
         clauses.append(f"sensor = {add(sensor)}")
     if date_from:
-        clauses.append(f"acquisition_start >= {add(date_from)}::timestamptz")
+        date_ref = add(date_from)
+        clauses.append(
+            f"(acquisition_start >= {date_ref}::timestamptz OR modified_at >= {date_ref}::timestamptz)"
+        )
     if date_to:
-        clauses.append(f"acquisition_start <= {add(date_to)}::timestamptz")
+        date_ref = add(date_to)
+        clauses.append(
+            f"(acquisition_start <= {date_ref}::timestamptz OR modified_at <= {date_ref}::timestamptz)"
+        )
     add_admin_boundary_filter(clauses, add, province, kabupaten, kecamatan)
     if bbox:
         clauses.append(
@@ -269,9 +275,15 @@ async def count_datasets(
     if sensor:
         clauses.append(f"sensor = {add(sensor)}")
     if date_from:
-        clauses.append(f"acquisition_start >= {add(date_from)}::timestamptz")
+        date_ref = add(date_from)
+        clauses.append(
+            f"(acquisition_start >= {date_ref}::timestamptz OR modified_at >= {date_ref}::timestamptz)"
+        )
     if date_to:
-        clauses.append(f"acquisition_start <= {add(date_to)}::timestamptz")
+        date_ref = add(date_to)
+        clauses.append(
+            f"(acquisition_start <= {date_ref}::timestamptz OR modified_at <= {date_ref}::timestamptz)"
+        )
     if footprint_only:
         clauses.append("footprint IS NOT NULL")
     add_admin_boundary_filter(clauses, add, province, kabupaten, kecamatan)
