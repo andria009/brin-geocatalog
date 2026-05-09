@@ -1,0 +1,144 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${GEOCATALOG_DB_NAME:-geocatalog}
+      POSTGRES_USER: ${GEOCATALOG_DB_USER:-geocatalog}
+      POSTGRES_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+    ports:
+      - "${GEOCATALOG_DB_HOST_PORT:-55432}:5432"
+    volumes:
+      - geocatalog-postgres-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${GEOCATALOG_DB_USER:-geocatalog} -d ${GEOCATALOG_DB_NAME:-geocatalog}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GEOCATALOG_DB_HOST: db
+      GEOCATALOG_DB_PORT: 5432
+      GEOCATALOG_DB_NAME: ${GEOCATALOG_DB_NAME:-geocatalog}
+      GEOCATALOG_DB_USER: ${GEOCATALOG_DB_USER:-geocatalog}
+      GEOCATALOG_DB_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+    ports:
+      - "${GEOCATALOG_API_PORT:-8010}:8010"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./data/reference:/app/data/reference:ro
+    command: ["geocatalog", "serve", "--host", "0.0.0.0", "--port", "8010"]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GEOCATALOG_DB_HOST: db
+      GEOCATALOG_DB_PORT: 5432
+      GEOCATALOG_DB_NAME: ${GEOCATALOG_DB_NAME:-geocatalog}
+      GEOCATALOG_DB_USER: ${GEOCATALOG_DB_USER:-geocatalog}
+      GEOCATALOG_DB_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+    volumes:
+      - ${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}:/data/geomimo:ro
+      - ./data/reference:/app/data/reference:ro
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["geocatalog", "scan", "--root", "/data/geomimo", "--limit", "1000"]
+
+  worker-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["service"]
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GEOCATALOG_DB_HOST: db
+      GEOCATALOG_DB_PORT: 5432
+      GEOCATALOG_DB_NAME: ${GEOCATALOG_DB_NAME:-geocatalog}
+      GEOCATALOG_DB_USER: ${GEOCATALOG_DB_USER:-geocatalog}
+      GEOCATALOG_DB_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+    volumes:
+      - ${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}:/data/geomimo:ro
+      - ./data/reference:/app/data/reference:ro
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      [
+        "geocatalog",
+        "scan-loop",
+        "--root",
+        "/data/geomimo",
+        "--interval-seconds",
+        "${GEOCATALOG_WORKER_INTERVAL_SECONDS:-600}",
+      ]
+
+  footprint-backfill-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["service"]
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GEOCATALOG_DB_HOST: db
+      GEOCATALOG_DB_PORT: 5432
+      GEOCATALOG_DB_NAME: ${GEOCATALOG_DB_NAME:-geocatalog}
+      GEOCATALOG_DB_USER: ${GEOCATALOG_DB_USER:-geocatalog}
+      GEOCATALOG_DB_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+    volumes:
+      - ${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}:/data/geomimo:ro
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      [
+        "geocatalog",
+        "backfill-footprints-loop",
+        "--batch-size",
+        "${GEOCATALOG_FOOTPRINT_BATCH_SIZE:-1000}",
+        "--interval-seconds",
+        "${GEOCATALOG_FOOTPRINT_INTERVAL_SECONDS:-600}",
+        "--progress-interval",
+        "${GEOCATALOG_FOOTPRINT_PROGRESS_INTERVAL:-100}",
+      ]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "${GEOCATALOG_FRONTEND_PORT:-8090}:80"
+    depends_on:
+      - api
+
+  tiler:
+    image: ghcr.io/developmentseed/titiler:latest
+    profiles: ["tiler"]
+    ports:
+      - "${GEOCATALOG_TILER_PORT:-8011}:80"
+
+volumes:
+  geocatalog-postgres-data:
