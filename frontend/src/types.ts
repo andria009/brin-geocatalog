@@ -1,5 +1,6 @@
 export type Dataset = {
   id: string;
+  stac_item_id: string;
   collection_id: string;
   title: string;
   dataset_type: string;
@@ -15,6 +16,7 @@ export type Dataset = {
   modified_at: string;
   bbox: number[] | null;
   properties: Record<string, unknown>;
+  download_url: string;
 };
 
 export type DatasetResponse = {

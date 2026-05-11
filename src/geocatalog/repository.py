@@ -178,9 +178,13 @@ async def search_datasets(
     *,
     q: str | None = None,
     collection_id: str | None = None,
+    collection_ids: list[str] | None = None,
+    ids: list[str] | None = None,
     dataset_type: str | None = None,
     platform: str | None = None,
     sensor: str | None = None,
+    product: str | None = None,
+    file_extension: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     province: str | None = None,
@@ -189,6 +193,7 @@ async def search_datasets(
     bbox: list[float] | None = None,
     limit: int = 100,
     offset: int = 0,
+    sortby: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     clauses = []
     args: list[Any] = []
@@ -201,12 +206,20 @@ async def search_datasets(
         clauses.append(f"search_text @@ plainto_tsquery('simple', {add(q)})")
     if collection_id:
         clauses.append(f"collection_id = {add(collection_id)}")
+    if collection_ids:
+        clauses.append(f"collection_id = ANY({add(collection_ids)}::text[])")
+    if ids:
+        clauses.append(f"id = ANY({add(ids)}::uuid[])")
     if dataset_type:
         clauses.append(f"dataset_type = {add(dataset_type)}")
     if platform:
         clauses.append(f"platform = {add(platform)}")
     if sensor:
         clauses.append(f"sensor = {add(sensor)}")
+    if product:
+        clauses.append(f"product = {add(product)}")
+    if file_extension:
+        clauses.append(f"file_extension = {add(file_extension)}")
     if date_from:
         date_ref = add(date_from)
         clauses.append(
@@ -225,6 +238,7 @@ async def search_datasets(
         )
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    order_sql = build_dataset_order_sql(sortby)
     args.extend([limit, offset])
     rows = await conn.fetch(
         f"""
@@ -233,7 +247,7 @@ async def search_datasets(
                acquisition_end, file_size_bytes, modified_at, bbox, properties, stac_item
         FROM datasets
         {where_sql}
-        ORDER BY coalesce(acquisition_start, modified_at) DESC
+        ORDER BY {order_sql}
         LIMIT ${len(args) - 1} OFFSET ${len(args)}
         """,
         *args,
@@ -246,9 +260,13 @@ async def count_datasets(
     *,
     q: str | None = None,
     collection_id: str | None = None,
+    collection_ids: list[str] | None = None,
+    ids: list[str] | None = None,
     dataset_type: str | None = None,
     platform: str | None = None,
     sensor: str | None = None,
+    product: str | None = None,
+    file_extension: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     province: str | None = None,
@@ -268,12 +286,20 @@ async def count_datasets(
         clauses.append(f"search_text @@ plainto_tsquery('simple', {add(q)})")
     if collection_id:
         clauses.append(f"collection_id = {add(collection_id)}")
+    if collection_ids:
+        clauses.append(f"collection_id = ANY({add(collection_ids)}::text[])")
+    if ids:
+        clauses.append(f"id = ANY({add(ids)}::uuid[])")
     if dataset_type:
         clauses.append(f"dataset_type = {add(dataset_type)}")
     if platform:
         clauses.append(f"platform = {add(platform)}")
     if sensor:
         clauses.append(f"sensor = {add(sensor)}")
+    if product:
+        clauses.append(f"product = {add(product)}")
+    if file_extension:
+        clauses.append(f"file_extension = {add(file_extension)}")
     if date_from:
         date_ref = add(date_from)
         clauses.append(
@@ -295,6 +321,28 @@ async def count_datasets(
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     return await conn.fetchval(f"SELECT count(*) FROM datasets {where_sql}", *args)
+
+
+def build_dataset_order_sql(sortby: list[dict[str, str]] | None) -> str:
+    allowed = {
+        "datetime": "coalesce(acquisition_start, modified_at)",
+        "properties.datetime": "coalesce(acquisition_start, modified_at)",
+        "acquisition_start": "acquisition_start",
+        "modified": "modified_at",
+        "modified_at": "modified_at",
+        "title": "title",
+        "platform": "platform",
+    }
+    order_parts = []
+    for sort in sortby or []:
+        field = sort.get("field") or sort.get("property")
+        expression = allowed.get(str(field))
+        if not expression:
+            continue
+        direction = "ASC" if str(sort.get("direction", "desc")).lower() == "asc" else "DESC"
+        order_parts.append(f"{expression} {direction} NULLS LAST")
+    order_parts.append("coalesce(acquisition_start, modified_at) DESC NULLS LAST")
+    return ", ".join(order_parts)
 
 
 def add_admin_boundary_filter(

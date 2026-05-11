@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -9,7 +11,14 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 import typer
 import uvicorn
 
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+
 from geocatalog.api import create_app
+from geocatalog.config import get_settings
 from geocatalog.db import connection
 from geocatalog.repository import (
     list_datasets_without_footprint,
@@ -21,6 +30,8 @@ from geocatalog.repository import (
 from geocatalog.scanner import extract_footprint, inspect_file, iter_supported_files
 
 app = typer.Typer(help="GeoCatalog command line tools.")
+stac_app = typer.Typer(help="STAC sync commands — populate PgSTAC from the geocatalog index.")
+app.add_typer(stac_app, name="stac")
 
 
 @app.command()
@@ -423,3 +434,168 @@ async def ensure_runtime_schema(conn) -> None:
         ON admin_boundaries(level, code)
         """
     )
+
+
+# ---------------------------------------------------------------------------
+# stac sub-commands
+# ---------------------------------------------------------------------------
+
+@stac_app.command("sync")
+def stac_sync(
+    collection: str | None = typer.Option(
+        None, "--collection", "-c",
+        help="Collection ID to sync (e.g. landsat-8-oli-tirs). Defaults to all collections.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Print what would be synced without writing to PgSTAC.",
+    ),
+):
+    """Sync geocatalog indexed datasets into PgSTAC as scene-level STAC Items."""
+    asyncio.run(_run_stac_sync(collection, dry_run))
+
+
+@stac_app.command("status")
+def stac_status():
+    """Show per-collection dataset counts available for sync."""
+    asyncio.run(_run_stac_status())
+
+
+_STAC_STATE_FILE = Path("/app/logs/stac_sync_state.json")
+
+
+@stac_app.command("sync-loop")
+def stac_sync_loop(
+    interval_seconds: int = typer.Option(
+        600, "--interval-seconds",
+        help="Seconds between incremental sync passes.",
+    ),
+    state_file: Path = typer.Option(
+        _STAC_STATE_FILE, "--state-file",
+        help="JSON file used to persist the last successful sync timestamp across restarts.",
+    ),
+):
+    """
+    Run incremental STAC syncs on a loop.
+
+    On startup the last successful sync timestamp is read from the state file.
+    Only collections with rows updated/created after that timestamp are
+    processed, so each pass is fast after the first full sync. The timestamp
+    is saved atomically after every successful pass.
+    """
+    asyncio.run(_run_stac_sync_loop(interval_seconds, state_file))
+
+
+async def _run_stac_sync_loop(interval_seconds: int, state_file: Path) -> None:
+    from geocatalog.stac_sync import run_sync
+
+    settings = get_settings()
+
+    def _load_since() -> datetime | None:
+        try:
+            data = json.loads(state_file.read_text())
+            ts = data.get("last_sync_at")
+            return datetime.fromisoformat(ts).replace(tzinfo=UTC) if ts else None
+        except (FileNotFoundError, KeyError, ValueError):
+            return None
+
+    def _save_since(dt: datetime) -> None:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"last_sync_at": dt.isoformat()}))
+        tmp.replace(state_file)
+
+    since = _load_since()
+    if since:
+        log(f"stac sync-loop started — resuming from {since.isoformat()}")
+    else:
+        log("stac sync-loop started — no prior state, full sync on first pass")
+
+    while True:
+        started_at = datetime.now(UTC)
+        try:
+            async with connection() as conn:
+                result = await run_sync(
+                    conn,
+                    pgstac_dsn=settings.pgstac_dsn,
+                    collection_id=None,
+                    api_base_url=settings.api_base_url,
+                    since=since,
+                )
+            log(
+                f"stac sync-loop pass done — "
+                f"collections={result['collections']} scenes={result['scenes']} "
+                f"assets={result['assets']} deleted={result['deleted']} failed={result['failed']}"
+            )
+            if result["failed"] == 0:
+                _save_since(started_at)
+                since = started_at
+        except Exception:
+            log("stac sync-loop pass failed — will retry next interval")
+            import traceback
+            traceback.print_exc()
+
+        time.sleep(interval_seconds)
+
+
+async def _run_stac_sync(collection_id: str | None, dry_run: bool) -> None:
+    from geocatalog.stac_sync import run_sync
+
+    settings = get_settings()
+    log(
+        f"stac sync started collection={collection_id or '*'} "
+        f"pgstac={settings.pgstac_host}:{settings.pgstac_port}/{settings.pgstac_name} "
+        f"api_base_url={settings.api_base_url}"
+        + (" [dry-run]" if dry_run else "")
+    )
+    async with connection() as conn:
+        result = await run_sync(
+            conn,
+            pgstac_dsn=settings.pgstac_dsn,
+            collection_id=collection_id,
+            api_base_url=settings.api_base_url,
+            dry_run=dry_run,
+        )
+    log(
+        f"stac sync completed collections={result['collections']} "
+        f"scenes={result['scenes']} assets={result['assets']} "
+        f"deleted={result['deleted']} failed={result['failed']}"
+    )
+    if result["failed"]:
+        raise typer.Exit(code=1)
+
+
+async def _run_stac_status() -> None:
+    async with connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT collection_id,
+                   count(*) AS files,
+                   count(DISTINCT
+                     CASE WHEN platform IN ('landsat-8','landsat-9','landsat')
+                          THEN regexp_replace(
+                                 upper(file_name),
+                                 '^(L[COEST]\\d{2}_\\w+_\\d{6}_\\d{8}_\\d{8}_\\d{2}_(?:RT|T1|T2)).*$',
+                                 '\\1'
+                               )
+                          ELSE id::text
+                     END
+                   ) AS estimated_scenes,
+                   min(acquisition_start) AS temporal_start,
+                   max(acquisition_start) AS temporal_end
+            FROM datasets
+            GROUP BY collection_id
+            ORDER BY collection_id
+            """
+        )
+    typer.echo(
+        f"{'COLLECTION':<40} {'FILES':>7} {'SCENES':>7}  TEMPORAL RANGE"
+    )
+    typer.echo("-" * 80)
+    for row in rows:
+        start = row["temporal_start"].strftime("%Y-%m-%d") if row["temporal_start"] else "—"
+        end = row["temporal_end"].strftime("%Y-%m-%d") if row["temporal_end"] else "—"
+        typer.echo(
+            f"{row['collection_id']:<40} {row['files']:>7} {row['estimated_scenes']:>7}"
+            f"  {start} → {end}"
+        )

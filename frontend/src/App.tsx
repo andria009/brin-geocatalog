@@ -838,14 +838,14 @@ function DatasetInspector({ selected, onClose }: { selected: Dataset; onClose: (
         <strong>{selected.title}</strong>
         <span>{selected.source_path}</span>
         <div className="action-row">
-          <a href={`${apiBase}/datasets/${selected.id}/download`}>
+          <a href={apiUrl(selected.download_url)}>
             <Download size={14} /> Download
           </a>
           <a href={`${apiBase}/datasets/${selected.id}/odc`} target="_blank" rel="noreferrer">
             <ExternalLink size={14} /> ODC
           </a>
           <a
-            href={`/stac/collections/${selected.collection_id}/items/${selected.id}`}
+            href={`/stac/collections/${selected.collection_id}/items/${selected.stac_item_id}`}
             target="_blank"
             rel="noreferrer"
           >
@@ -982,6 +982,16 @@ function formatDateTime(value: string | null | undefined) {
     return "-";
   }
   return new Date(value).toLocaleString();
+}
+
+function apiUrl(path: string) {
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  if (path.startsWith("/api/v1")) {
+    return `${apiBase}${path.slice("/api/v1".length)}`;
+  }
+  return path;
 }
 
 function formatBytes(value: number | null | undefined) {

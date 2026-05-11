@@ -51,6 +51,11 @@ services:
       GEOCATALOG_DB_NAME: ${GEOCATALOG_DB_NAME:-geocatalog}
       GEOCATALOG_DB_USER: ${GEOCATALOG_DB_USER:-geocatalog}
       GEOCATALOG_DB_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+      GEOCATALOG_PGSTAC_HOST: pgstac-db
+      GEOCATALOG_PGSTAC_PORT: 5432
+      GEOCATALOG_PGSTAC_NAME: ${PGSTAC_DB_NAME:-pgstac}
+      GEOCATALOG_PGSTAC_USER: ${PGSTAC_DB_USER:-pgstac}
+      GEOCATALOG_PGSTAC_PASSWORD: ${PGSTAC_DB_PASSWORD:-pgstac_dev}
     volumes:
       - ${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}:/data/geomimo:ro
       - ./data/reference:/app/data/reference:ro
@@ -75,6 +80,11 @@ services:
       GEOCATALOG_DB_NAME: ${GEOCATALOG_DB_NAME:-geocatalog}
       GEOCATALOG_DB_USER: ${GEOCATALOG_DB_USER:-geocatalog}
       GEOCATALOG_DB_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+      GEOCATALOG_PGSTAC_HOST: pgstac-db
+      GEOCATALOG_PGSTAC_PORT: 5432
+      GEOCATALOG_PGSTAC_NAME: ${PGSTAC_DB_NAME:-pgstac}
+      GEOCATALOG_PGSTAC_USER: ${PGSTAC_DB_USER:-pgstac}
+      GEOCATALOG_PGSTAC_PASSWORD: ${PGSTAC_DB_PASSWORD:-pgstac_dev}
     volumes:
       - ${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}:/data/geomimo:ro
       - ./data/reference:/app/data/reference:ro
@@ -125,6 +135,42 @@ services:
         "${GEOCATALOG_FOOTPRINT_PROGRESS_INTERVAL:-100}",
       ]
 
+  stac-sync-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["service"]
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GEOCATALOG_DB_HOST: db
+      GEOCATALOG_DB_PORT: 5432
+      GEOCATALOG_DB_NAME: ${GEOCATALOG_DB_NAME:-geocatalog}
+      GEOCATALOG_DB_USER: ${GEOCATALOG_DB_USER:-geocatalog}
+      GEOCATALOG_DB_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+      GEOCATALOG_PGSTAC_HOST: pgstac-db
+      GEOCATALOG_PGSTAC_PORT: 5432
+      GEOCATALOG_PGSTAC_NAME: ${PGSTAC_DB_NAME:-pgstac}
+      GEOCATALOG_PGSTAC_USER: ${PGSTAC_DB_USER:-pgstac}
+      GEOCATALOG_PGSTAC_PASSWORD: ${PGSTAC_DB_PASSWORD:-pgstac_dev}
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      pgstac-migrate:
+        condition: service_completed_successfully
+    command:
+      [
+        "geocatalog",
+        "stac",
+        "sync-loop",
+        "--interval-seconds",
+        "${GEOCATALOG_STAC_SYNC_INTERVAL_SECONDS:-600}",
+      ]
+
   frontend:
     build:
       context: .
@@ -140,5 +186,79 @@ services:
     ports:
       - "${GEOCATALOG_TILER_PORT:-8011}:80"
 
+  # ---------------------------------------------------------------------------
+  # PgSTAC stack — runs alongside the existing geocatalog services.
+  # pgstac-db holds the STAC schema; stac-api serves the standards-grade
+  # STAC API. pgstac-migrate runs once at startup to initialise the schema.
+  # ---------------------------------------------------------------------------
+
+  pgstac-db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${PGSTAC_DB_NAME:-pgstac}
+      POSTGRES_USER: ${PGSTAC_DB_USER:-pgstac}
+      POSTGRES_PASSWORD: ${PGSTAC_DB_PASSWORD:-pgstac_dev}
+    ports:
+      - "${PGSTAC_DB_HOST_PORT:-55433}:5432"
+    volumes:
+      - pgstac-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGSTAC_DB_USER:-pgstac} -d ${PGSTAC_DB_NAME:-pgstac}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgstac-migrate:
+    build:
+      context: services/stac-api
+      dockerfile: Dockerfile
+    environment:
+      PGSTAC_DB_HOST: pgstac-db
+      PGSTAC_DB_PORT: 5432
+      PGSTAC_DB_NAME: ${PGSTAC_DB_NAME:-pgstac}
+      PGSTAC_DB_USER: ${PGSTAC_DB_USER:-pgstac}
+      PGSTAC_DB_PASSWORD: ${PGSTAC_DB_PASSWORD:-pgstac_dev}
+    depends_on:
+      pgstac-db:
+        condition: service_healthy
+    command:
+      - "sh"
+      - "-c"
+      - >
+        pypgstac migrate
+        --dsn postgresql://$${PGSTAC_DB_USER}:$${PGSTAC_DB_PASSWORD}@$${PGSTAC_DB_HOST}:$${PGSTAC_DB_PORT}/$${PGSTAC_DB_NAME}
+    restart: on-failure
+
+  stac-api:
+    build:
+      context: services/stac-api
+      dockerfile: Dockerfile
+    environment:
+      # PgSTAC database connection (stac-fastapi-pgstac 3.x env var names)
+      POSTGRES_USER: ${PGSTAC_DB_USER:-pgstac}
+      POSTGRES_PASS: ${PGSTAC_DB_PASSWORD:-pgstac_dev}
+      POSTGRES_HOST: pgstac-db
+      POSTGRES_HOST_READER: pgstac-db
+      POSTGRES_HOST_WRITER: pgstac-db
+      POSTGRES_PORT: 5432
+      POSTGRES_DBNAME: ${PGSTAC_DB_NAME:-pgstac}
+      # API metadata
+      STAC_FASTAPI_TITLE: "GeoCatalog STAC API"
+      STAC_FASTAPI_DESCRIPTION: "BRIN GeoCatalog — SpatioTemporal Asset Catalog"
+      STAC_FASTAPI_VERSION: "1.0.0"
+      STAC_FASTAPI_LANDING_ID: "geocatalog-stac"
+      # uvicorn bind
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8080"
+      # reverse-proxy prefix: nginx strips /stac/ before forwarding, but
+      # root_path tells uvicorn/stac-fastapi to prefix all self-referencing hrefs
+      APP_ROOT_PATH: "/stac"
+    ports:
+      - "${STAC_API_PORT:-8012}:8080"
+    depends_on:
+      pgstac-migrate:
+        condition: service_completed_successfully
+
 volumes:
   geocatalog-postgres-data:
+  pgstac-postgres-data:

@@ -17,11 +17,15 @@ dependencies = [
 
 [project.optional-dependencies]
 geo = [
+  "psycopg[binary]",
+  "psycopg-pool",
+  "pypgstac",
   "pystac>=1.14.0",
   "rasterio>=1.4.0",
   "shapely>=2.1.0",
 ]
 dev = [
+  "pytest>=9.0.0",
   "ruff>=0.14.0",
 ]
 
@@ -38,4 +42,3 @@ packages = ["src/geocatalog"]
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-

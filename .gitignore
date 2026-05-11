@@ -12,3 +12,5 @@ frontend/tsconfig.tsbuildinfo
 logs/*
 !logs/.gitkeep
 
+docs/
+
