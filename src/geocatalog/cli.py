@@ -11,12 +11,6 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 import typer
 import uvicorn
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-
 from geocatalog.api import create_app
 from geocatalog.config import get_settings
 from geocatalog.db import connection
@@ -28,6 +22,12 @@ from geocatalog.repository import (
     upsert_dataset,
 )
 from geocatalog.scanner import extract_footprint, inspect_file, iter_supported_files
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
 
 app = typer.Typer(help="GeoCatalog command line tools.")
 stac_app = typer.Typer(help="STAC sync commands — populate PgSTAC from the geocatalog index.")

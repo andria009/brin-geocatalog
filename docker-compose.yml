@@ -36,12 +36,14 @@ services:
         condition: service_healthy
     volumes:
       - ./data/reference:/app/data/reference:ro
+      - ./logs:/app/logs:ro
     command: ["geocatalog", "serve", "--host", "0.0.0.0", "--port", "8010"]
 
   worker:
     build:
       context: .
       dockerfile: Dockerfile
+    profiles: ["tools"]
     env_file:
       - path: .env
         required: false
@@ -179,6 +181,7 @@ services:
       - "${GEOCATALOG_FRONTEND_PORT:-8090}:80"
     depends_on:
       - api
+      - stac-api
 
   tiler:
     image: ghcr.io/developmentseed/titiler:latest

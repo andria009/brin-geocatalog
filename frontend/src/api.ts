@@ -3,6 +3,7 @@ import type {
   LocationOptions,
   PlatformStatus,
   ScanRun,
+  ServiceStatus,
   SourceFile
 } from "./types";
 
@@ -55,6 +56,35 @@ export async function getPlatforms(): Promise<PlatformStatus[]> {
 export async function getRuns(): Promise<ScanRun[]> {
   const response = await getJson<{ items: ScanRun[] }>("/scan-runs?limit=10", { items: [] });
   return response.items;
+}
+
+export async function getServices(): Promise<ServiceStatus[]> {
+  const response = await getJson<{ items: ServiceStatus[] }>("/services", { items: [] });
+  return response.items;
+}
+
+export async function getStacApiStatus(): Promise<ServiceStatus> {
+  try {
+    const response = await fetch("/stac/");
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}`);
+    }
+    return {
+      service: "stac-api",
+      label: "STAC API",
+      status: "running",
+      detail: "PgSTAC-backed STAC API is responding.",
+      updated_at: new Date().toISOString()
+    };
+  } catch {
+    return {
+      service: "stac-api",
+      label: "STAC API",
+      status: "unknown",
+      detail: "STAC API could not be reached from the frontend.",
+      updated_at: new Date().toISOString()
+    };
+  }
 }
 
 export async function getSourceFiles(): Promise<SourceFile[]> {

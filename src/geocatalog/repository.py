@@ -202,8 +202,7 @@ async def search_datasets(
         args.append(value)
         return f"${len(args)}"
 
-    if q:
-        clauses.append(f"search_text @@ plainto_tsquery('simple', {add(q)})")
+    add_text_search_filter(clauses, add, q)
     if collection_id:
         clauses.append(f"collection_id = {add(collection_id)}")
     if collection_ids:
@@ -282,8 +281,7 @@ async def count_datasets(
         args.append(value)
         return f"${len(args)}"
 
-    if q:
-        clauses.append(f"search_text @@ plainto_tsquery('simple', {add(q)})")
+    add_text_search_filter(clauses, add, q)
     if collection_id:
         clauses.append(f"collection_id = {add(collection_id)}")
     if collection_ids:
@@ -343,6 +341,42 @@ def build_dataset_order_sql(sortby: list[dict[str, str]] | None) -> str:
         order_parts.append(f"{expression} {direction} NULLS LAST")
     order_parts.append("coalesce(acquisition_start, modified_at) DESC NULLS LAST")
     return ", ".join(order_parts)
+
+
+def add_text_search_filter(clauses: list[str], add, q: str | None) -> None:
+    text = q.strip() if q else ""
+    if not text:
+        return
+    if "*" not in text and "?" not in text:
+        clauses.append(f"search_text @@ plainto_tsquery('simple', {add(text)})")
+        return
+    pattern = wildcard_to_ilike_pattern(text)
+    pattern_ref = add(pattern)
+    clauses.append(
+        "("
+        f"title ILIKE {pattern_ref} ESCAPE '~' OR "
+        f"file_name ILIKE {pattern_ref} ESCAPE '~' OR "
+        f"source_path ILIKE {pattern_ref} ESCAPE '~' OR "
+        f"collection_id ILIKE {pattern_ref} ESCAPE '~' OR "
+        f"platform ILIKE {pattern_ref} ESCAPE '~' OR "
+        f"sensor ILIKE {pattern_ref} ESCAPE '~' OR "
+        f"product ILIKE {pattern_ref} ESCAPE '~'"
+        ")"
+    )
+
+
+def wildcard_to_ilike_pattern(value: str) -> str:
+    pattern = []
+    for char in value:
+        if char == "*":
+            pattern.append("%")
+        elif char == "?":
+            pattern.append("_")
+        elif char in ("%_~"):
+            pattern.append(f"~{char}")
+        else:
+            pattern.append(char)
+    return "".join(pattern)
 
 
 def add_admin_boundary_filter(

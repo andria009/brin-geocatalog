@@ -36,8 +36,12 @@ logger = logging.getLogger(__name__)
 
 LANDSAT_PLATFORMS: frozenset[str] = frozenset({"landsat-8", "landsat-9", "landsat"})
 SENTINEL2_PLATFORMS: frozenset[str] = frozenset({"sentinel-2a", "sentinel-2b", "sentinel-2"})
-MODIS_PLATFORMS: frozenset[str] = frozenset({"terra-modis", "aqua-modis", "modis"})
-VIIRS_PLATFORMS: frozenset[str] = frozenset({"suomi-npp-viirs", "noaa-20-viirs", "viirs"})
+MODIS_PLATFORMS: frozenset[str] = frozenset(
+    {"terra", "aqua", "terra-modis", "aqua-modis", "modis"}
+)
+VIIRS_PLATFORMS: frozenset[str] = frozenset(
+    {"suomi-npp", "noaa-20", "suomi-npp-viirs", "noaa-20-viirs", "viirs"}
+)
 
 # Platforms where multiple files map to one STAC Item
 GROUPED_PLATFORMS: frozenset[str] = (
@@ -65,11 +69,13 @@ _S2_LONG_RE = re.compile(
     re.IGNORECASE,
 )
 
-# MODIS: MOD09GA.A2024105.h28v08.061.2024107023547.hdf
-# VIIRS: VNP09GA.A2024106.h27v08.002.2024107214722.h5
-# Capture product + year-DOY + tile (ignore version and processing timestamp)
+# MODIS gridded: MOD09GA.A2024105.h28v08.061.2024107023547.hdf
+# VIIRS gridded: VNP09GA.A2024106.h27v08.002.2024107214722.h5
+# MODIS swath legacy: a1.21001.1751.geo.hdf / a1.21014.0457.mod14.hdf
+# Capture the granule key while ignoring product suffixes, versions, and
+# processing timestamps.
 _MODIS_VIIRS_GRANULE_RE = re.compile(
-    r"^((MOD|MYD|MCD|VNP|VJ1|VJ2)\w+\.A\d{7}\.h\d{2}v\d{2})",
+    r"^(((?:MOD|MYD|MCD|VNP|VJ1|VJ2)\w+\.A\d{7}\.h\d{2}v\d{2})|([at]\d\.\d{5}\.\d{4}))",
     re.IGNORECASE,
 )
 
@@ -250,10 +256,24 @@ def _modis_viirs_granule_key(file_name: str) -> str | None:
     """Return product+date+tile key for MODIS/VIIRS files.
 
     e.g. MOD09GA.A2024105.h28v08 from MOD09GA.A2024105.h28v08.061.2024107023547.hdf
+    or a1.21001.1751 from a1.21001.1751.geo.hdf / a1.21001.1751.mod14.hdf
     """
     stem = Path(file_name).stem
     m = _MODIS_VIIRS_GRANULE_RE.match(stem)
     return m.group(1) if m else None
+
+
+def stac_item_id_for_dataset(platform: str | None, file_name: str, fallback_id: str) -> str:
+    """Return the PgSTAC item ID used for a geocatalog dataset row."""
+    if platform in LANDSAT_PLATFORMS:
+        scene_id, _ = _landsat_scene_parts(file_name)
+        return scene_id or fallback_id
+    if platform in SENTINEL2_PLATFORMS:
+        scene_id, _ = _sentinel2_scene_parts(file_name)
+        return scene_id or fallback_id
+    if platform in MODIS_PLATFORMS | VIIRS_PLATFORMS:
+        return _modis_viirs_granule_key(file_name) or fallback_id
+    return fallback_id
 
 
 # ---------------------------------------------------------------------------
@@ -566,11 +586,11 @@ _SCENE_KEY_SQL = """
                '^(T\\d{2}[A-Z]{3}_\\d{8}T\\d{6})_.*$',
                '\\1'
              )
-        WHEN platform IN ('terra-modis','aqua-modis','modis',
-                          'suomi-npp-viirs','noaa-20-viirs','viirs')
+        WHEN platform IN ('terra','aqua','terra-modis','aqua-modis','modis',
+                          'suomi-npp','noaa-20','suomi-npp-viirs','noaa-20-viirs','viirs')
         THEN regexp_replace(
                file_name,
-               '^((MOD|MYD|MCD|VNP|VJ1|VJ2)\\w+\\.A\\d{7}\\.h\\d{2}v\\d{2}).*$',
+               '^(((MOD|MYD|MCD|VNP|VJ1|VJ2)\\w+\\.A\\d{7}\\.h\\d{2}v\\d{2})|([at][0-9]\\.\\d{5}\\.\\d{4})).*$',
                '\\1'
              )
         ELSE id::text
@@ -628,11 +648,11 @@ async def _fetch_collection_rows(
                            '^(T\\d{{2}}[A-Z]{{3}}_\\d{{8}}T\\d{{6}})_.*$',
                            '\\1'
                          )
-                    WHEN d.platform IN ('terra-modis','aqua-modis','modis',
-                                        'suomi-npp-viirs','noaa-20-viirs','viirs')
+                    WHEN d.platform IN ('terra','aqua','terra-modis','aqua-modis','modis',
+                                        'suomi-npp','noaa-20','suomi-npp-viirs','noaa-20-viirs','viirs')
                     THEN regexp_replace(
                            d.file_name,
-                           '^((MOD|MYD|MCD|VNP|VJ1|VJ2)\\w+\\.A\\d{{7}}\\.h\\d{{2}}v\\d{{2}}).*$',
+                           '^(((MOD|MYD|MCD|VNP|VJ1|VJ2)\\w+\\.A\\d{{7}}\\.h\\d{{2}}v\\d{{2}})|([at][0-9]\\.\\d{{5}}\\.\\d{{4}})).*$',
                            '\\1'
                          )
                     ELSE d.id::text
@@ -655,24 +675,14 @@ async def _fetch_expected_item_ids(
     """Return the complete set of STAC item IDs that geocatalog expects in PgSTAC."""
     if platform in GROUPED_PLATFORMS:
         rows = await conn.fetch(
-            f"SELECT id::text, file_name, platform FROM datasets WHERE collection_id = $1",
+            "SELECT id::text, file_name, platform FROM datasets WHERE collection_id = $1",
             collection_id,
         )
         ids: set[str] = set()
         for r in rows:
             fn = r["file_name"]
             plat = r["platform"]
-            if plat in LANDSAT_PLATFORMS:
-                scene_id, _ = _landsat_scene_parts(fn)
-                ids.add(scene_id if scene_id else r["id"])
-            elif plat in SENTINEL2_PLATFORMS:
-                scene_id, _ = _sentinel2_scene_parts(fn)
-                ids.add(scene_id if scene_id else r["id"])
-            elif plat in MODIS_PLATFORMS | VIIRS_PLATFORMS:
-                key = _modis_viirs_granule_key(fn)
-                ids.add(key if key else r["id"])
-            else:
-                ids.add(r["id"])
+            ids.add(stac_item_id_for_dataset(plat, fn, r["id"]))
         return ids
     else:
         rows = await conn.fetch(
@@ -716,6 +726,7 @@ def _write_to_pgstac(
     n_deleted = 0
     if expected_ids is not None:
         with psycopg.connect(pgstac_dsn) as conn:
+            conn.execute("SET search_path TO pgstac, public")
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id FROM items WHERE collection = %s",

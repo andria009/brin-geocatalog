@@ -1,4 +1,6 @@
 import {
+  ChevronDown,
+  ChevronRight,
   Download,
   ExternalLink,
   Activity,
@@ -23,17 +25,26 @@ import {
   getLocations,
   getPlatforms,
   getRuns,
+  getServices,
   getSourceFiles,
-  apiBase,
+  getStacApiStatus,
   type DatasetFilters
 } from "./api";
 import logo from "./assets/geocatalog-logo.png";
-import type { Dataset, LocationOptions, PlatformStatus, ScanRun, SourceFile } from "./types";
+import type {
+  Dataset,
+  LocationOptions,
+  PlatformStatus,
+  ScanRun,
+  ServiceStatus,
+  SourceFile
+} from "./types";
 
 type Basemap = "street" | "satellite";
 type RightRailMode = "details" | "datasets" | null;
+type DetailSection = "services" | "platforms" | "runs" | "sources";
 const MAX_MAP_RECORDS = 1000;
-const DATASET_PAGE_SIZE = 100;
+const DATASET_PAGE_SIZE = 20;
 
 export default function App() {
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -50,6 +61,7 @@ export default function App() {
   const [appliedFilters, setAppliedFilters] = useState<DatasetFilters | null>(null);
   const [platforms, setPlatforms] = useState<PlatformStatus[]>([]);
   const [runs, setRuns] = useState<ScanRun[]>([]);
+  const [services, setServices] = useState<ServiceStatus[]>([]);
   const [sources, setSources] = useState<SourceFile[]>([]);
   const [locations, setLocations] = useState<LocationOptions>({
     provinces: [],
@@ -60,6 +72,12 @@ export default function App() {
   const [selectedBoundary, setSelectedBoundary] = useState<GeoJSON.Feature | null>(null);
   const [basemap, setBasemap] = useState<Basemap>("street");
   const [rightRailMode, setRightRailMode] = useState<RightRailMode>(null);
+  const [detailSections, setDetailSections] = useState<Record<DetailSection, boolean>>({
+    services: true,
+    platforms: true,
+    runs: true,
+    sources: true
+  });
   const [selectAreaMode, setSelectAreaMode] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -261,6 +279,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (rightRailMode !== "details" && !runs.some((run) => run.status === "running")) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void refreshOperations();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [rightRailMode, runs]);
+
+  useEffect(() => {
     void refreshLocations();
   }, [province, kabupaten]);
 
@@ -330,6 +358,13 @@ export default function App() {
     setRightRailMode((current) => (current === mode ? null : mode));
   }
 
+  function toggleDetailSection(section: DetailSection) {
+    setDetailSections((current) => ({
+      ...current,
+      [section]: !current[section]
+    }));
+  }
+
   function selectDataset(item: Dataset, shouldFit = true) {
     setSelected(item);
     if (shouldFit && item.bbox?.length === 4) {
@@ -341,19 +376,15 @@ export default function App() {
     setLoading(true);
     setLoadError("");
     try {
-      const [countResponse, platformRows, runRows, sourceRows] = await Promise.all([
+      const [countResponse, operations] = await Promise.all([
         getDatasets(filters, 1, 0),
-        getPlatforms(),
-        getRuns(),
-        getSourceFiles()
+        fetchOperations()
       ]);
       setTotalDatasets(countResponse.total);
       setDatasets([]);
       setMapDatasets([]);
       setSelected(null);
-      setPlatforms(platformRows);
-      setRuns(runRows);
-      setSources(sourceRows);
+      applyOperations(operations);
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : "Catalog data failed to load.");
     } finally {
@@ -374,18 +405,14 @@ export default function App() {
     try {
       const active = hasActiveDatasetFilter(nextFilters);
       const offset = page * DATASET_PAGE_SIZE;
-      const [datasetResponse, platformRows, runRows, sourceRows] = await Promise.all([
+      const [datasetResponse, operations] = await Promise.all([
         active ? getDatasets(nextFilters, DATASET_PAGE_SIZE, offset) : getDatasets(nextFilters, 1, 0),
-        getPlatforms(),
-        getRuns(),
-        getSourceFiles()
+        fetchOperations()
       ]);
       setTotalDatasets(datasetResponse.total);
       setDatasetPage(active ? page : 0);
       setDatasets(active ? datasetResponse.items : []);
-      setPlatforms(platformRows);
-      setRuns(runRows);
-      setSources(sourceRows);
+      applyOperations(operations);
 
       if (active && datasetResponse.total < MAX_MAP_RECORDS) {
         const mapResponse = await getDatasets(nextFilters, MAX_MAP_RECORDS, 0);
@@ -398,6 +425,47 @@ export default function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function refreshOperations() {
+    try {
+      applyOperations(await fetchOperations());
+    } catch {
+      // Keep the current rail content if the lightweight status refresh fails.
+    }
+  }
+
+  async function fetchOperations() {
+    const [platformRows, runRows, serviceRows, stacApiStatus, sourceRows] = await Promise.all([
+      getPlatforms(),
+      getRuns(),
+      getServices(),
+      getStacApiStatus(),
+      getSourceFiles()
+    ]);
+    return {
+      platforms: platformRows,
+      runs: runRows,
+      services: [
+        {
+          service: "frontend",
+          label: "Frontend",
+          status: "running",
+          detail: "Web interface is loaded.",
+          updated_at: new Date().toISOString()
+        },
+        stacApiStatus,
+        ...serviceRows
+      ],
+      sources: sourceRows
+    };
+  }
+
+  function applyOperations(operations: Awaited<ReturnType<typeof fetchOperations>>) {
+    setPlatforms(operations.platforms);
+    setRuns(operations.runs);
+    setServices(operations.services);
+    setSources(operations.sources);
   }
 
   async function refreshLocations() {
@@ -632,7 +700,7 @@ export default function App() {
             <RefreshCw size={15} />
             Refresh
           </button>
-          <button className="toolbar-button" onClick={downloadVisibleGeoJson}>
+          <button className="toolbar-button" onClick={downloadVisibleGeoJson} disabled>
             <Download size={15} />
             GeoJSON
           </button>
@@ -713,49 +781,90 @@ export default function App() {
       {rightRailMode === "details" ? (
       <aside className="right-rail">
         <section className="panel">
-          <div className="panel-title">
-            <Activity size={16} /> Status by Platform
-          </div>
-          <div className="status-list">
-            {platforms.map((item) => (
-              <div key={item.platform} className="status-row">
-                <span>{item.platform}</span>
-                <strong>{formatNumber(item.total)}</strong>
-              </div>
-            ))}
-          </div>
+          <button className="panel-title collapsible-title" onClick={() => toggleDetailSection("platforms")}>
+            <span><Activity size={16} /> Status by Platform</span>
+            {detailSections.platforms ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          </button>
+          {detailSections.platforms ? (
+            <div className="status-list">
+              {platforms.map((item) => (
+                <div key={item.platform} className="status-row">
+                  <span>{item.platform}</span>
+                  <strong>{formatNumber(item.total)}</strong>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </section>
 
         <section className="panel">
-          <div className="panel-title">
-            <Database size={16} /> Recent Runs
-          </div>
-          <div className="run-list">
-            {runs.slice(0, 3).map((run) => (
-              <div key={run.id} className="run-row">
-                <strong>{formatDateTime(run.started_at)}</strong>
-                <span>{run.status}</span>
-                <small>
-                  {formatNumber(run.scanned_files)} scanned, {formatNumber(run.indexed_files)} new,{" "}
-                  {formatNumber(run.unchanged_files)} unchanged, {formatNumber(run.removed_files)} removed
-                </small>
-              </div>
-            ))}
-          </div>
+          <button className="panel-title collapsible-title" onClick={() => toggleDetailSection("runs")}>
+            <span><Database size={16} /> Recent Runs</span>
+            {detailSections.runs ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          </button>
+          {detailSections.runs ? (
+            <div className="run-list">
+              {runs.slice(0, 3).map((run) => (
+                <div key={run.id} className="run-row">
+                  <div className="run-heading">
+                    <strong>{formatDateTime(run.started_at)}</strong>
+                    <span className={`service-pill service-pill-${statusTone(run.status)}`}>
+                      {run.status}
+                    </span>
+                  </div>
+                  <span>{run.root_path}</span>
+                  <small>
+                    {formatNumber(run.scanned_files)} scanned, {formatNumber(run.indexed_files)} new,{" "}
+                    {formatNumber(run.updated_files)} updated, {formatNumber(run.unchanged_files)} unchanged,{" "}
+                    {formatNumber(run.removed_files)} removed, {formatNumber(run.skipped_files)} skipped
+                  </small>
+                  <div className={`run-meter ${run.status === "running" ? "active" : ""}`}>
+                    <span />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </section>
 
         <section className="panel">
-          <div className="panel-title">
-            <FolderOpen size={16} /> Source Files
-          </div>
-          <div className="source-list">
-            {sources.slice(0, 3).map((item) => (
-              <button key={item.id}>
-                <strong>{item.file_name}</strong>
-                <span>{item.folder}</span>
-              </button>
-            ))}
-          </div>
+          <button className="panel-title collapsible-title" onClick={() => toggleDetailSection("services")}>
+            <span><Activity size={16} /> Service Status</span>
+            {detailSections.services ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          </button>
+          {detailSections.services ? (
+            <div className="service-list">
+              {services.map((item) => (
+                <div key={item.service} className="service-row">
+                  <div>
+                    <strong>{item.label}</strong>
+                    <span>{item.detail}</span>
+                    {item.updated_at ? <small>Updated {formatDateTime(item.updated_at)}</small> : null}
+                  </div>
+                  <span className={`service-pill service-pill-${statusTone(item.status)}`}>
+                    {item.status}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </section>
+
+        <section className="panel">
+          <button className="panel-title collapsible-title" onClick={() => toggleDetailSection("sources")}>
+            <span><FolderOpen size={16} /> Source Files</span>
+            {detailSections.sources ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          </button>
+          {detailSections.sources ? (
+            <div className="source-list">
+              {sources.slice(0, 5).map((item) => (
+                <button key={item.id}>
+                  <strong>{item.file_name}</strong>
+                  <span>{item.folder}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
         </section>
 
       </aside>
@@ -838,12 +947,12 @@ function DatasetInspector({ selected, onClose }: { selected: Dataset; onClose: (
         <strong>{selected.title}</strong>
         <span>{selected.source_path}</span>
         <div className="action-row">
-          <a href={apiUrl(selected.download_url)}>
+          <button disabled>
             <Download size={14} /> Download
-          </a>
-          <a href={`${apiBase}/datasets/${selected.id}/odc`} target="_blank" rel="noreferrer">
+          </button>
+          <button disabled>
             <ExternalLink size={14} /> ODC
-          </a>
+          </button>
           <a
             href={`/stac/collections/${selected.collection_id}/items/${selected.stac_item_id}`}
             target="_blank"
@@ -984,14 +1093,18 @@ function formatDateTime(value: string | null | undefined) {
   return new Date(value).toLocaleString();
 }
 
-function apiUrl(path: string) {
-  if (/^https?:\/\//i.test(path)) {
-    return path;
+function statusTone(status: string) {
+  const normalized = status.toLowerCase();
+  if (["running", "synced", "completed", "available"].includes(normalized)) {
+    return "ok";
   }
-  if (path.startsWith("/api/v1")) {
-    return `${apiBase}${path.slice("/api/v1".length)}`;
+  if (["pending", "unknown"].includes(normalized)) {
+    return "muted";
   }
-  return path;
+  if (["failed", "error"].includes(normalized)) {
+    return "bad";
+  }
+  return "muted";
 }
 
 function formatBytes(value: number | null | undefined) {

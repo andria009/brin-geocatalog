@@ -18,6 +18,16 @@ The catalog discovers files, extracts available metadata, indexes footprints and
 - Generate Open Data Cube compatible product and dataset documents.
 - Run every service through Docker Compose.
 
+## Current Functional Scope
+
+- Folder scanning and metadata indexing for satellite imagery and geospatial files under mounted source folders.
+- Resume checkpoints for interrupted scans, plus folder-level removal detection so moved/deleted files can be reflected in the catalog.
+- Spatial footprint extraction for supported raster files, with continuous backfill support.
+- Indonesian administrative boundary enrichment for province, kabupaten/kota, and kecamatan filters.
+- Read-only catalog API for datasets, scan runs, service status, source files, administrative boundaries, and ODC-style metadata.
+- Production STAC API served by stac-fastapi-pgstac + PgSTAC, populated by the incremental STAC sync service.
+- Frontend map visualization with OpenStreetMap and ESRI World Imagery basemaps.
+
 ## Services
 
 ### Default services (always started)
@@ -26,11 +36,16 @@ The catalog discovers files, extracts available metadata, indexes footprints and
 |---|---|---|
 | `db` | PostgreSQL/PostGIS catalog database | 55432 |
 | `api` | Catalog REST API | 8010 |
-| `worker` | One-shot scanner and metadata extraction | — |
 | `frontend` | MapLibre web interface + nginx reverse proxy | 8090 |
 | `pgstac-db` | PostgreSQL/PostGIS database for PgSTAC | 55433 |
 | `pgstac-migrate` | One-shot PgSTAC schema migration (runs on startup) | — |
 | `stac-api` | stac-fastapi-pgstac 6.2.2 — full STAC API | 8012 |
+
+### Manual utility services (`--profile tools`)
+
+| Service | Description |
+|---|---|
+| `worker` | One-shot CLI utility for scans, reference imports, and manual STAC syncs |
 
 ### Background loop services (`--profile service`)
 
@@ -39,6 +54,13 @@ The catalog discovers files, extracts available metadata, indexes footprints and
 | `worker-service` | Continuous scanner loop |
 | `stac-sync-service` | Incremental STAC sync from catalog DB to PgSTAC (every 10 min) |
 | `footprint-backfill-service` | Continuous spatial footprint extraction for HDF4/MODIS files |
+
+Operational notes:
+
+- `worker-service`, `footprint-backfill-service`, and `stac-sync-service` are optional long-running services enabled through `--profile service`.
+- `worker` is a manual utility container enabled through `--profile tools`.
+- `api` mounts `./logs:/app/logs:ro` so `/api/v1/services` can report the latest STAC sync checkpoint written by `stac-sync-service`.
+- Log timestamps are emitted in UTC (`+00:00`). Indonesia WIB is UTC+7.
 
 ## Technology Stack
 
@@ -58,10 +80,16 @@ Copy the example environment file if you want to override ports or scan paths:
 cp .env.example .env
 ```
 
-Build all containers:
+Build default containers:
 
 ```bash
 docker compose build
+```
+
+Build optional background and manual utility containers:
+
+```bash
+docker compose --profile service --profile tools build
 ```
 
 Start all default services (catalog DB, API, frontend, PgSTAC database, STAC API):
@@ -74,6 +102,105 @@ Start background loop services as well:
 
 ```bash
 docker compose --profile service up -d
+```
+
+Default startup does not run a scan. Use the manual `worker` command for one-off jobs, or start `worker-service` when you want continuous rescans.
+
+### Fresh Installation
+
+For a completely fresh installation, stop every service and delete the Compose volumes first. This removes the catalog database, PgSTAC database, and synced STAC records:
+
+```bash
+docker compose --profile service --profile tools down -v
+rm -rf logs/*
+docker compose --profile service --profile tools build
+docker compose up -d
+docker compose --profile service up -d
+```
+
+The `logs/` cleanup removes scan and STAC sync checkpoints so the worker starts from the beginning.
+
+Then reload the Indonesian administrative boundaries and restart indexing:
+
+```bash
+docker compose run --rm worker geocatalog import-reference --level province --file /app/data/reference/provinces.geojson
+docker compose run --rm worker geocatalog import-reference --level kabupaten --file /app/data/reference/kabupaten.geojson
+docker compose run --rm worker geocatalog import-reference --level kecamatan --file /app/data/reference/kecamatan.geojson
+docker compose --profile service up -d worker-service footprint-backfill-service stac-sync-service
+```
+
+## Database Migrations
+
+GeoCatalog currently uses two migration mechanisms.
+
+### Catalog Database
+
+The catalog database schema lives in `db/init/001_schema.sql` and is mounted into the `db` container at `/docker-entrypoint-initdb.d`.
+
+PostgreSQL runs this file automatically only when the `geocatalog-postgres-data` volume is created for the first time. It creates:
+
+- PostGIS, `pg_trgm`, and `pgcrypto` extensions.
+- `datasets`
+- `scan_runs`
+- `scan_checkpoints`
+- `admin_boundaries`
+- Search, temporal, collection, and spatial indexes.
+
+The schema file includes idempotent `CREATE ... IF NOT EXISTS` and selected `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. This helps fresh installs and some incremental upgrades, but it is not yet a full migration framework for already-running production databases.
+
+For a fresh catalog database, use the fresh-install flow above. To recreate only the catalog database volume, first confirm the Compose volume name, then remove that volume while the database service is stopped:
+
+```bash
+docker compose stop db
+docker volume ls | grep geocatalog-postgres-data
+docker volume rm geocatalog_geocatalog-postgres-data
+docker compose up -d db
+```
+
+For an existing database, inspect the current schema before applying manual SQL:
+
+```bash
+docker compose exec db psql -U geocatalog -d geocatalog -c "\dt"
+docker compose exec db psql -U geocatalog -d geocatalog -c "\d datasets"
+docker compose exec db psql -U geocatalog -d geocatalog -c "\d scan_runs"
+```
+
+If `db/init/001_schema.sql` gains a new idempotent `ALTER TABLE` statement, apply it manually to an existing database with care:
+
+```bash
+docker compose exec db psql -U geocatalog -d geocatalog -f /docker-entrypoint-initdb.d/001_schema.sql
+```
+
+Back up production data before running schema updates manually.
+
+### PgSTAC Database
+
+PgSTAC uses its own migration command. The `pgstac-migrate` service runs:
+
+```bash
+pypgstac migrate --dsn postgresql://...
+```
+
+It runs during default Compose startup after `pgstac-db` is healthy, and `stac-api` waits for it to complete successfully.
+
+Run or rerun PgSTAC migration manually:
+
+```bash
+docker compose up pgstac-migrate
+```
+
+Verify PgSTAC migration status and tables:
+
+```bash
+docker compose exec pgstac-db psql -U pgstac -d pgstac -c "SELECT * FROM pgstac.migrations ORDER BY version DESC LIMIT 5;"
+docker compose exec pgstac-db psql -U pgstac -d pgstac -c "SELECT count(*) FROM pgstac.items;"
+docker compose exec pgstac-db psql -U pgstac -d pgstac -c "SELECT id FROM pgstac.collections ORDER BY id;"
+```
+
+PgSTAC data can be rebuilt from the catalog database by rerunning STAC sync after migration:
+
+```bash
+docker compose run --rm worker geocatalog stac sync
 ```
 
 Run one scan of the mounted data folder:
@@ -114,6 +241,12 @@ Run the scanner continuously:
 docker compose --profile service up worker-service
 ```
 
+Stop only the continuous scanner:
+
+```bash
+docker compose --profile service stop worker-service
+```
+
 Run continuous scene-footprint backfill for indexed rasters:
 
 ```bash
@@ -138,6 +271,7 @@ Track scan status through the API:
 
 ```bash
 curl http://localhost:8010/api/v1/status
+curl http://localhost:8010/api/v1/services
 curl http://localhost:8010/api/v1/scan-runs
 ```
 
@@ -147,6 +281,13 @@ Inspect database content from the host:
 docker compose exec db psql -U geocatalog -d geocatalog -c "SELECT status, started_at, finished_at, scanned_files, indexed_files, updated_files, unchanged_files, removed_files, skipped_files FROM scan_runs ORDER BY started_at DESC LIMIT 5;"
 docker compose exec db psql -U geocatalog -d geocatalog -c "SELECT platform, count(*) FROM datasets GROUP BY platform ORDER BY count DESC;"
 docker compose exec db psql -U geocatalog -d geocatalog -c "SELECT count(*) AS total, count(*) FILTER (WHERE footprint IS NOT NULL) AS with_footprint FROM datasets;"
+```
+
+Inspect STAC sync checkpoint visibility:
+
+```bash
+docker compose exec stac-sync-service cat /app/logs/stac_sync_state.json
+docker compose exec api cat /app/logs/stac_sync_state.json
 ```
 
 Load Indonesian administrative reference boundaries:
@@ -163,12 +304,12 @@ Because services share a Dockerfile but produce separate images, rebuild only th
 
 ```bash
 # After changes to scanner.py, stac_sync.py, cli.py, or any src/ file:
-docker compose build worker
+docker compose --profile tools build worker
 
 # Each profile service uses its own image — rebuild them separately:
-docker compose build worker-service
-docker compose build footprint-backfill-service
-docker compose build stac-sync-service
+docker compose --profile service build worker-service
+docker compose --profile service build footprint-backfill-service
+docker compose --profile service build stac-sync-service
 
 # stac-api / pgstac-migrate share services/stac-api/Dockerfile:
 docker compose build stac-api pgstac-migrate
@@ -181,6 +322,14 @@ Then restart only the rebuilt service without touching the others:
 
 ```bash
 docker compose up -d --no-deps <service-name>
+```
+
+The `--profile` option belongs immediately after `docker compose`, for example `docker compose --profile service build`, not `docker compose build --profile service`.
+
+If a Compose volume definition changes, recreate the affected container instead of only rebuilding:
+
+```bash
+docker compose up -d --force-recreate api
 ```
 
 ## Access Points
@@ -202,6 +351,7 @@ The STAC API is served by stac-fastapi-pgstac and exposed through the nginx fron
 
 - `GET /api/v1/health`
 - `GET /api/v1/status`
+- `GET /api/v1/services`
 - `GET /api/v1/platforms`
 - `GET /api/v1/scan-runs`
 - `GET /api/v1/source-files`
@@ -212,6 +362,32 @@ The STAC API is served by stac-fastapi-pgstac and exposed through the nginx fron
 - `GET /api/v1/search`
 - `GET /api/v1/locations`
 - `GET /api/v1/boundary`
+
+`/api/v1/services` is a lightweight operational endpoint used by the frontend detail rail. It reports frontend/API reachability, catalog database status, latest worker progress, STAC sync checkpoint status, and footprint-backfill availability.
+
+## Frontend
+
+The web frontend is available at `http://localhost:8090`.
+
+Current features:
+
+- Indonesia-centered MapLibre map.
+- OpenStreetMap street basemap and ESRI World Imagery satellite basemap.
+- Sidebar filters ordered as text, platform, type/sensor, date, province, kabupaten/kota, and kecamatan.
+- Text filter supports normal full-text search and wildcard search. Use `*` for any characters and `?` for one character, for example `LC08*QA*` or `a1.210??.*`.
+- Area selection from the map by drawing a bounding box.
+- Dataset rail paginated at 20 records per page.
+- Detail rail with collapsible sections ordered as Status by Platform, Recent Runs, Service Status, and Source Files.
+- Source Files section shows the latest 5 processed files.
+- Selected Dataset inspector shows source path, collection, platform, sensor, file size, acquisition/modified times, bbox, and STAC link.
+
+Temporarily disabled frontend actions:
+
+- Map GeoJSON download button.
+- Selected Dataset Download button.
+- Selected Dataset ODC button.
+
+The REST endpoints for dataset download and ODC metadata still exist, but the frontend buttons are disabled until asset access and ODC workflow details are finalized.
 
 ## STAC API
 
@@ -246,6 +422,8 @@ The `stac-sync-service` runs every 10 minutes and syncs datasets from the catalo
 | All others | One file = one STAC Item | geocatalog dataset UUID |
 
 Datasets without a valid spatial footprint (bbox IS NULL) are excluded from STAC — PgSTAC requires non-null geometry.
+
+The sync service writes its last successful checkpoint to `logs/stac_sync_state.json`. Manual one-shot syncs do not update that loop checkpoint.
 
 Run a one-shot sync manually:
 
@@ -310,7 +488,7 @@ Pagination uses token-based cursors (`next` / `prev` links in the response). `nu
 
 The catalog API supports:
 
-- Free text search
+- Free text search with optional `*` and `?` wildcards
 - Dataset type, source, platform, and sensor filters
 - Date/time range search
 - Province, kabupaten/kota, and kecamatan filters
@@ -338,40 +516,6 @@ The scanner recognizes these satellite/platform families from folder names and f
 - ZiYuan-302: MUX
 
 Supported file formats: GeoTIFF, JP2/J2K, NITF, IMG, VRT, HDF/HDF4, HDF5, NetCDF, GeoJSON, GeoPackage, Shapefile, and FlatGeobuf.
-
-## Open Data Cube Compatibility
-
-GeoCatalog exposes ODC-style dataset documents via the `/api/v1/datasets/{id}/odc` endpoint. A later phase can add direct `datacube dataset add` integration if an ODC database is available.
-
-## Architecture
-
-```
-/mnt/geomimo-data (mounted data)
-      |
-      v
-geocatalog scanner/indexer (worker / worker-service)
-      |
-      v
-Catalog DB — PostgreSQL/PostGIS (port 55432)
-      |
-      +---> Catalog REST API (port 8010)
-      |
-      +---> STAC sync worker (stac-sync-service)
-                  |
-                  v
-            PgSTAC DB — PostgreSQL/PostGIS (port 55433)
-                  |
-                  v
-            stac-fastapi-pgstac (port 8012)
-                  |
-                  v
-            Full STAC API — 26 conformance classes
-
-nginx frontend (port 8090)
-  /api/  → Catalog REST API (port 8010)
-  /stac/ → stac-fastapi-pgstac (port 8012)
-  /      → React frontend (static files)
-```
 
 ## License
 

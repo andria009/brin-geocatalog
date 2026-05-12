@@ -519,7 +519,7 @@ def _extract_footprint_hdf4(path: Path) -> dict[str, object] | None:
                 "footprint skip — SDS read error (%s): %s", type(exc).__name__, path
             )
     else:
-        logger.warning(
+        logger.debug(
             "footprint skip — no lat/lon SDS found (subdatasets=%d): %s",
             len(sds_pairs), path,
         )

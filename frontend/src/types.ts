@@ -50,6 +50,15 @@ export type ScanRun = {
   message: string | null;
 };
 
+export type ServiceStatus = {
+  service: string;
+  label: string;
+  status: string;
+  detail: string;
+  updated_at: string | null;
+  progress?: Record<string, number>;
+};
+
 export type SourceFile = {
   id: string;
   platform: string | null;
