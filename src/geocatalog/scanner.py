@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid5, NAMESPACE_URL
 
@@ -36,6 +37,17 @@ DATE_PATTERNS = [
     re.compile(r"(?P<year>20\d{2})(?P<month>\d{2})(?P<day>\d{2})"),
     re.compile(r"(?P<year>20\d{2})[-_](?P<month>\d{2})[-_](?P<day>\d{2})"),
 ]
+
+LOCAL_LANDSAT_RE = re.compile(
+    r"^L(?P<satellite>[89])(?P<processing>[A-Z]+)(?P<path>\d{3})(?P<row>\d{3})(?P<suffix>[A-Z]?)_"
+    r"(?P<day>\d{2})(?P<month>\d{2})(?P<year>\d{2})",
+    re.IGNORECASE,
+)
+
+LOCAL_LANDSAT_SCENE_FOLDER_RE = re.compile(
+    r"^L(?P<satellite>\d)(?P<path>\d{3})(?P<row>\d{3})(?P<year>20\d{2})(?P<doy>\d{3})",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -100,7 +112,7 @@ def iter_supported_files(
 def inspect_file(path: Path) -> DatasetCandidate:
     stat = path.stat()
     modified_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
-    acquisition = parse_date(path.name)
+    acquisition = infer_acquisition_datetime(path)
     platform, sensor = infer_platform_sensor(path)
     product = infer_product(path)
     collection_id = "-".join(part for part in [platform, sensor, product] if part) or "uncategorized"
@@ -113,6 +125,7 @@ def inspect_file(path: Path) -> DatasetCandidate:
         "relative_parent": str(path.parent),
         "indexed_by": "geocatalog",
     }
+    properties.update(infer_cloud_metadata(path))
     stac_item = {
         "type": "Feature",
         "stac_version": "1.0.0",
@@ -170,8 +183,37 @@ def parse_date(name: str) -> datetime | None:
     return None
 
 
+def infer_acquisition_datetime(path: Path) -> datetime | None:
+    return parse_local_landsat_scene_date(path) or parse_date(path.name)
+
+
+def parse_local_landsat_scene_date(path: Path) -> datetime | None:
+    for part in [path.stem, *[parent.name for parent in path.parents]]:
+        folder_match = LOCAL_LANDSAT_SCENE_FOLDER_RE.match(part)
+        if folder_match:
+            try:
+                year = int(folder_match.group("year"))
+                doy = int(folder_match.group("doy"))
+                return datetime(year, 1, 1, tzinfo=UTC) + timedelta(days=doy - 1)
+            except ValueError:
+                return None
+    name_match = LOCAL_LANDSAT_RE.match(path.stem)
+    if name_match:
+        try:
+            year = 2000 + int(name_match.group("year"))
+            month = int(name_match.group("month"))
+            day = int(name_match.group("day"))
+            return datetime(year, month, day, tzinfo=UTC)
+        except ValueError:
+            return None
+    return None
+
+
 def infer_platform_sensor(path: Path) -> tuple[str | None, str | None]:
     text = normalize_path_text(path)
+    local_landsat = infer_local_landsat_platform_sensor(path)
+    if local_landsat:
+        return local_landsat
     if has_any(text, ["sentinel-1a", "/s1a", "s1a-"]):
         return "sentinel-1a", "c-sar"
     if has_any(text, ["sentinel-2a", "/s2a", "s2a-"]):
@@ -229,6 +271,10 @@ def infer_platform_sensor(path: Path) -> tuple[str | None, str | None]:
 
 def infer_product(path: Path) -> str | None:
     text = normalize_path_text(path)
+    rgb_match = re.search(r"rgb(?P<bands>\d{3})", text)
+    if rgb_match:
+        product = f"rgb{rgb_match.group('bands')}"
+        return f"{product}-nohaze" if "nohaze" in text or "no-haze" in text else product
     for product in [
         "ndvi",
         "hotspot",
@@ -254,6 +300,92 @@ def infer_dataset_type(path: Path) -> str:
     if ext in {".json", ".geojson", ".gpkg", ".shp", ".fgb"}:
         return "vector"
     return "file"
+
+
+def infer_cloud_metadata(path: Path) -> dict[str, object]:
+    landsat = infer_landsat_cloud_metadata(path)
+    if landsat:
+        return landsat
+    sentinel = infer_sentinel2_cloud_metadata(path)
+    if sentinel:
+        return sentinel
+    return {}
+
+
+def infer_landsat_cloud_metadata(path: Path) -> dict[str, object]:
+    mtl_files = sorted(path.parent.glob("*_MTL.txt"))
+    for mtl_file in mtl_files:
+        values = parse_key_value_metadata(mtl_file)
+        cloud_cover = parse_float(values.get("CLOUD_COVER"))
+        cloud_cover_land = parse_float(values.get("CLOUD_COVER_LAND"))
+        if cloud_cover is not None or cloud_cover_land is not None:
+            result: dict[str, object] = {
+                "cloud_source": str(mtl_file),
+                "cloud_method": "landsat_mtl",
+            }
+            if cloud_cover is not None:
+                result["cloud_cover"] = cloud_cover
+            if cloud_cover_land is not None:
+                result["cloud_cover_land"] = cloud_cover_land
+            return result
+    return {}
+
+
+def infer_sentinel2_cloud_metadata(path: Path) -> dict[str, object]:
+    metadata_files = list(path.parent.glob("MTD_*.xml"))
+    metadata_files.extend(path.parent.glob("**/MTD_*.xml"))
+    for metadata_file in sorted(set(metadata_files)):
+        try:
+            tree = ET.parse(metadata_file)
+        except (ET.ParseError, OSError):
+            continue
+        root = tree.getroot()
+        for element in root.iter():
+            if element.tag.split("}")[-1] == "Cloud_Coverage_Assessment" and element.text:
+                cloud_cover = parse_float(element.text)
+                if cloud_cover is not None:
+                    return {
+                        "cloud_cover": cloud_cover,
+                        "cloud_source": str(metadata_file),
+                        "cloud_method": "sentinel2_mtd",
+                    }
+    return {}
+
+
+def parse_key_value_metadata(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"')
+    return values
+
+
+def parse_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def infer_local_landsat_platform_sensor(path: Path) -> tuple[str, str] | None:
+    name_match = LOCAL_LANDSAT_RE.match(path.stem)
+    if name_match:
+        satellite = name_match.group("satellite")
+        return ("landsat-8", "oli") if satellite == "8" else ("landsat-9", "oli-2")
+    text = normalize_path_text(path)
+    if "reflektan-ls8" in text or "/ls8/" in text:
+        return "landsat-8", "oli"
+    if "reflektan-ls9" in text or "/ls9/" in text:
+        return "landsat-9", "oli-2"
+    return None
 
 
 _HDF4_EXTENSIONS: frozenset[str] = frozenset({".hdf", ".hdf4", ".h4", ".he4"})
@@ -544,12 +676,12 @@ def _extract_footprint_rasterio(path: Path) -> dict[str, object] | None:
         import rasterio
         from rasterio.warp import transform_bounds
     except ImportError:
-        return None
+        return _extract_footprint_gdalinfo(path)
     try:
         with rasterio.open(path) as dataset:
             if not dataset.crs:
                 logger.warning("footprint skip — no CRS: %s", path)
-                return None
+                return _extract_footprint_gdalinfo(path)
             west, south, east, north = transform_bounds(
                 dataset.crs,
                 "EPSG:4326",
@@ -558,8 +690,62 @@ def _extract_footprint_rasterio(path: Path) -> dict[str, object] | None:
             )
     except Exception as exc:
         logger.warning("footprint skip — rasterio error (%s): %s", type(exc).__name__, path)
-        return None
+        return _extract_footprint_gdalinfo(path)
     return _bbox_geometry(west, south, east, north)
+
+
+def _extract_footprint_gdalinfo(path: Path) -> dict[str, object] | None:
+    import json
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["gdalinfo", "-json", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        logger.warning("footprint skip — gdalinfo not found in PATH: %s", path)
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("footprint skip — gdalinfo timeout: %s", path)
+        return None
+    if result.returncode != 0:
+        logger.warning("footprint skip — gdalinfo failed: %s", path)
+        return None
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.warning("footprint skip — gdalinfo JSON invalid: %s", path)
+        return None
+
+    extent = info.get("wgs84Extent")
+    if extent:
+        ring = extent.get("coordinates", [[]])[0]
+        if ring:
+            lons = [coord[0] for coord in ring]
+            lats = [coord[1] for coord in ring]
+            west, east = min(lons), max(lons)
+            south, north = min(lats), max(lats)
+            if -180 <= west <= east <= 180 and -90 <= south <= north <= 90:
+                return _bbox_geometry(west, south, east, north)
+
+    corners = info.get("cornerCoordinates", {})
+    points = [
+        corners.get("upperLeft"),
+        corners.get("lowerLeft"),
+        corners.get("upperRight"),
+        corners.get("lowerRight"),
+    ]
+    if all(points):
+        lons = [point[0] for point in points]
+        lats = [point[1] for point in points]
+        west, east = min(lons), max(lons)
+        south, north = min(lats), max(lats)
+        if -180 <= west <= east <= 180 and -90 <= south <= north <= 90:
+            return _bbox_geometry(west, south, east, north)
+    return None
 
 
 def file_fingerprint(path: Path, size: int, mtime_ns: int) -> str:

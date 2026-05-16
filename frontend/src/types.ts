@@ -71,6 +71,46 @@ export type SourceFile = {
   updated_at: string | null;
 };
 
+export type AccessUser = {
+  id: string;
+  sso_subject: string;
+  username: string;
+  display_name: string;
+  email: string;
+  role: "explorer" | "mage" | "sage" | "god";
+  policy: {
+    can_access_assets: boolean;
+    uses_tokens: boolean;
+  };
+  token_balance: number;
+  authenticated?: boolean;
+};
+
+export type AccessActivity = {
+  id: string;
+  user_id: string;
+  username: string;
+  role: "explorer" | "mage" | "sage" | "god";
+  activity: "search" | "download" | "stac_asset" | "odc_asset" | "admin_adjustment";
+  token_delta: number;
+  dataset_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  created_by: string | null;
+};
+
+export type LoginResponse = {
+  authenticated: boolean;
+  user: AccessUser;
+  expires_at: string;
+  session_timeout_seconds: number;
+  development_header: {
+    name: string;
+    value: string;
+  };
+  note: string;
+};
+
 export type LocationOption = {
   code: string;
   name: string;

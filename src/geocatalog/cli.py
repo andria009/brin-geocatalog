@@ -11,10 +11,12 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 import typer
 import uvicorn
 
+from geocatalog.access import DEV_USER_PASSWORDS
 from geocatalog.api import create_app
 from geocatalog.config import get_settings
 from geocatalog.db import connection
 from geocatalog.repository import (
+    seed_dev_access_users,
     list_datasets_without_footprint,
     remove_missing_files_in_folder,
     update_dataset_footprint,
@@ -31,7 +33,9 @@ logging.basicConfig(
 
 app = typer.Typer(help="GeoCatalog command line tools.")
 stac_app = typer.Typer(help="STAC sync commands — populate PgSTAC from the geocatalog index.")
+access_app = typer.Typer(help="Access-management commands for local development and SSO staging.")
 app.add_typer(stac_app, name="stac")
+app.add_typer(access_app, name="access")
 
 
 @app.command()
@@ -133,6 +137,17 @@ def backfill_footprints_loop(
     asyncio.run(loop())
 
 
+@access_app.command("seed-dev-users")
+def access_seed_dev_users():
+    """
+    Create one local test user for each GeoCatalog role.
+
+    These users are only for pre-SSO testing. Use their username or sso_subject
+    in the X-GeoCatalog-User request header to exercise access policies.
+    """
+    asyncio.run(run_access_seed_dev_users())
+
+
 async def run_scan(
     root: Path,
     limit: int | None = None,
@@ -229,6 +244,19 @@ async def run_scan(
         f"scan completed root={root} scanned={scanned} indexed={indexed} "
         f"updated={updated} unchanged={unchanged} removed={removed} skipped={skipped}"
     )
+
+
+async def run_access_seed_dev_users() -> None:
+    async with connection() as conn:
+        users = await seed_dev_access_users(conn)
+    for user in users:
+        token_text = f" tokens={user['token_balance']}" if user["role"] == "mage" else ""
+        password_text = f" password={DEV_USER_PASSWORDS[user['role']]}"
+        log(
+            "access dev user "
+            f"username={user['username']} sso_subject={user['sso_subject']} "
+            f"role={user['role']}{token_text}{password_text}"
+        )
 
 
 async def run_import_reference(level: str, file: Path) -> None:

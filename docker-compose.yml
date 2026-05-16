@@ -29,12 +29,14 @@ services:
       GEOCATALOG_DB_NAME: ${GEOCATALOG_DB_NAME:-geocatalog}
       GEOCATALOG_DB_USER: ${GEOCATALOG_DB_USER:-geocatalog}
       GEOCATALOG_DB_PASSWORD: ${GEOCATALOG_DB_PASSWORD:-geocatalog_dev}
+      GEOCATALOG_ASSET_ROOTS: /data/geomimo
     ports:
       - "${GEOCATALOG_API_PORT:-8010}:8010"
     depends_on:
       db:
         condition: service_healthy
     volumes:
+      - ${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}:/data/geomimo:ro
       - ./data/reference:/app/data/reference:ro
       - ./logs:/app/logs:ro
     command: ["geocatalog", "serve", "--host", "0.0.0.0", "--port", "8010"]
@@ -179,6 +181,8 @@ services:
       dockerfile: frontend/Dockerfile
     ports:
       - "${GEOCATALOG_FRONTEND_PORT:-8090}:80"
+    volumes:
+      - ${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}:/data/geomimo:ro
     depends_on:
       - api
       - stac-api

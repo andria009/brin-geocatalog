@@ -89,3 +89,41 @@ CREATE INDEX IF NOT EXISTS admin_boundaries_level_idx ON admin_boundaries(level)
 CREATE UNIQUE INDEX IF NOT EXISTS admin_boundaries_level_code_idx ON admin_boundaries(level, code);
 CREATE INDEX IF NOT EXISTS admin_boundaries_names_idx ON admin_boundaries(province, kabupaten, kecamatan);
 CREATE INDEX IF NOT EXISTS admin_boundaries_geom_idx ON admin_boundaries USING gist(geom);
+
+CREATE TABLE IF NOT EXISTS access_users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  sso_subject TEXT NOT NULL UNIQUE,
+  username TEXT,
+  display_name TEXT,
+  email TEXT,
+  password_hash TEXT,
+  password_updated_at TIMESTAMPTZ,
+  role TEXT NOT NULL DEFAULT 'explorer'
+    CHECK (role IN ('explorer', 'mage', 'sage', 'god')),
+  token_balance INTEGER NOT NULL DEFAULT 0 CHECK (token_balance >= 0),
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  approved_at TIMESTAMPTZ,
+  approved_by UUID REFERENCES access_users(id),
+  last_seen_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS access_users_role_idx ON access_users(role);
+CREATE INDEX IF NOT EXISTS access_users_active_idx ON access_users(is_active);
+
+CREATE TABLE IF NOT EXISTS access_token_ledger (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES access_users(id) ON DELETE CASCADE,
+  activity TEXT NOT NULL
+    CHECK (activity IN ('search', 'download', 'stac_asset', 'odc_asset', 'admin_adjustment')),
+  token_delta INTEGER NOT NULL,
+  dataset_id UUID REFERENCES datasets(id) ON DELETE SET NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by UUID REFERENCES access_users(id)
+);
+
+CREATE INDEX IF NOT EXISTS access_token_ledger_user_created_idx
+  ON access_token_ledger(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS access_token_ledger_dataset_idx
+  ON access_token_ledger(dataset_id);

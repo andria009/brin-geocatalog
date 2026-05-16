@@ -5,6 +5,15 @@ from typing import Any
 
 import asyncpg
 
+from geocatalog.access import (
+    DEV_USER_PASSWORDS,
+    MAGE_TOKEN_COSTS,
+    Role,
+    hash_password,
+    normalize_role,
+    token_cost,
+    verify_password,
+)
 from geocatalog.scanner import DatasetCandidate
 
 
@@ -59,6 +68,13 @@ async def upsert_dataset(conn: asyncpg.Connection, candidate: DatasetCandidate) 
           WHERE source_path = $5
             AND (
               checksum IS DISTINCT FROM $15
+              OR collection_id IS DISTINCT FROM $2
+              OR platform IS DISTINCT FROM $8
+              OR sensor IS DISTINCT FROM $9
+              OR product IS DISTINCT FROM $10
+              OR acquisition_start IS DISTINCT FROM $11
+              OR acquisition_end IS DISTINCT FROM $12
+              OR properties IS DISTINCT FROM $18::jsonb
               OR bbox IS DISTINCT FROM $16::double precision[]
               OR (footprint IS NULL AND $17::jsonb IS NOT NULL)
             )
@@ -187,6 +203,8 @@ async def search_datasets(
     file_extension: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    cloud_min: float | None = None,
+    cloud_max: float | None = None,
     province: str | None = None,
     kabupaten: str | None = None,
     kecamatan: str | None = None,
@@ -229,6 +247,7 @@ async def search_datasets(
         clauses.append(
             f"(acquisition_start <= {date_ref}::timestamptz OR modified_at <= {date_ref}::timestamptz)"
         )
+    add_cloud_cover_filter(clauses, add, cloud_min, cloud_max)
     add_admin_boundary_filter(clauses, add, province, kabupaten, kecamatan)
     if bbox:
         clauses.append(
@@ -268,6 +287,8 @@ async def count_datasets(
     file_extension: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    cloud_min: float | None = None,
+    cloud_max: float | None = None,
     province: str | None = None,
     kabupaten: str | None = None,
     kecamatan: str | None = None,
@@ -308,6 +329,7 @@ async def count_datasets(
         clauses.append(
             f"(acquisition_start <= {date_ref}::timestamptz OR modified_at <= {date_ref}::timestamptz)"
         )
+    add_cloud_cover_filter(clauses, add, cloud_min, cloud_max)
     if footprint_only:
         clauses.append("footprint IS NOT NULL")
     add_admin_boundary_filter(clauses, add, province, kabupaten, kecamatan)
@@ -363,6 +385,23 @@ def add_text_search_filter(clauses: list[str], add, q: str | None) -> None:
         f"product ILIKE {pattern_ref} ESCAPE '~'"
         ")"
     )
+
+
+def add_cloud_cover_filter(
+    clauses: list[str],
+    add,
+    cloud_min: float | None,
+    cloud_max: float | None,
+) -> None:
+    effective_min = None if cloud_min is None or cloud_min <= 0 else cloud_min
+    effective_max = None if cloud_max is None or cloud_max >= 100 else cloud_max
+    if effective_min is None and effective_max is None:
+        return
+    clauses.append("properties ? 'cloud_cover'")
+    if effective_min is not None:
+        clauses.append(f"(properties->>'cloud_cover')::double precision >= {add(effective_min)}")
+    if effective_max is not None:
+        clauses.append(f"(properties->>'cloud_cover')::double precision <= {add(effective_max)}")
 
 
 def wildcard_to_ilike_pattern(value: str) -> str:
@@ -625,3 +664,286 @@ async def get_catalog_status(conn: asyncpg.Connection) -> dict[str, Any]:
         "datasets": dict(dataset_row) if dataset_row else {},
         "latest_scan_run": dict(latest_run) if latest_run else None,
     }
+
+
+async def ensure_access_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_users (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          sso_subject TEXT NOT NULL UNIQUE,
+          username TEXT,
+          display_name TEXT,
+          email TEXT,
+          role TEXT NOT NULL DEFAULT 'explorer'
+            CHECK (role IN ('explorer', 'mage', 'sage', 'god')),
+          token_balance INTEGER NOT NULL DEFAULT 0 CHECK (token_balance >= 0),
+          is_active BOOLEAN NOT NULL DEFAULT true,
+          registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          approved_at TIMESTAMPTZ,
+          approved_by UUID REFERENCES access_users(id),
+          last_seen_at TIMESTAMPTZ
+        )
+        """
+    )
+    await conn.execute("CREATE INDEX IF NOT EXISTS access_users_role_idx ON access_users(role)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS access_users_active_idx ON access_users(is_active)")
+    await conn.execute("ALTER TABLE access_users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+    await conn.execute(
+        "ALTER TABLE access_users ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ"
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_token_ledger (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES access_users(id) ON DELETE CASCADE,
+          activity TEXT NOT NULL
+            CHECK (activity IN (
+              'search', 'download', 'stac_asset', 'odc_asset', 'admin_adjustment'
+            )),
+          token_delta INTEGER NOT NULL,
+          dataset_id UUID REFERENCES datasets(id) ON DELETE SET NULL,
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          created_by UUID REFERENCES access_users(id)
+        )
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS access_token_ledger_user_created_idx
+        ON access_token_ledger(user_id, created_at DESC)
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS access_token_ledger_dataset_idx
+        ON access_token_ledger(dataset_id)
+        """
+    )
+
+
+async def seed_dev_access_users(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    await ensure_access_schema(conn)
+    rows = []
+    for role in ("explorer", "mage", "sage", "god"):
+        user = await upsert_access_user(
+            conn,
+            sso_subject=f"dev:{role}",
+            username=f"{role}@geocatalog.local",
+            display_name=f"Dev {role.title()}",
+            email=f"{role}@geocatalog.local",
+            role=role,
+            token_balance=5000 if role == "mage" else 0,
+            password=DEV_USER_PASSWORDS[role],
+            approved=True,
+        )
+        rows.append(user)
+    return rows
+
+
+async def upsert_access_user(
+    conn: asyncpg.Connection,
+    *,
+    sso_subject: str,
+    username: str,
+    display_name: str,
+    email: str,
+    role: Role | str,
+    token_balance: int,
+    password: str | None = None,
+    approved: bool,
+) -> dict[str, Any]:
+    normalized_role = normalize_role(role)
+    password_hash = hash_password(password) if password else None
+    row = await conn.fetchrow(
+        """
+        INSERT INTO access_users (
+          sso_subject, username, display_name, email, password_hash, password_updated_at,
+          role, token_balance, approved_at
+        )
+        VALUES ($1, $2, $3, $4, $5, CASE WHEN $5::text IS NULL THEN NULL ELSE now() END,
+                $6, $7, CASE WHEN $8 THEN now() ELSE NULL END)
+        ON CONFLICT (sso_subject) DO UPDATE SET
+          username = EXCLUDED.username,
+          display_name = EXCLUDED.display_name,
+          email = EXCLUDED.email,
+          password_hash = COALESCE(EXCLUDED.password_hash, access_users.password_hash),
+          password_updated_at = CASE
+            WHEN EXCLUDED.password_hash IS NULL THEN access_users.password_updated_at
+            ELSE now()
+          END,
+          role = EXCLUDED.role,
+          token_balance = EXCLUDED.token_balance,
+          is_active = true,
+          approved_at = COALESCE(access_users.approved_at, EXCLUDED.approved_at)
+        RETURNING id::text, sso_subject, username, display_name, email, role,
+                  token_balance, is_active, registered_at, approved_at, last_seen_at,
+                  (password_hash IS NOT NULL) AS has_password, password_updated_at
+        """,
+        sso_subject,
+        username,
+        display_name,
+        email,
+        password_hash,
+        normalized_role,
+        token_balance,
+        approved,
+    )
+    return dict(row)
+
+
+async def get_access_user(conn: asyncpg.Connection, subject_or_username: str) -> dict[str, Any] | None:
+    await ensure_access_schema(conn)
+    row = await conn.fetchrow(
+        """
+        UPDATE access_users
+        SET last_seen_at = now()
+        WHERE is_active
+          AND (sso_subject = $1 OR username = $1)
+        RETURNING id::text, sso_subject, username, display_name, email, role,
+                  token_balance, is_active, registered_at, approved_at, last_seen_at,
+                  (password_hash IS NOT NULL) AS has_password, password_updated_at
+        """,
+        subject_or_username,
+    )
+    return dict(row) if row else None
+
+
+async def authenticate_access_user(
+    conn: asyncpg.Connection, username: str, password: str
+) -> dict[str, Any] | None:
+    await ensure_access_schema(conn)
+    row = await conn.fetchrow(
+        """
+        SELECT id::text, sso_subject, username, display_name, email, role,
+               token_balance, is_active, registered_at, approved_at, last_seen_at,
+               password_hash, password_updated_at
+        FROM access_users
+        WHERE is_active
+          AND (username = $1 OR sso_subject = $1)
+        """,
+        username,
+    )
+    if not row or not verify_password(password, row["password_hash"]):
+        return None
+    updated = await conn.fetchrow(
+        """
+        UPDATE access_users
+        SET last_seen_at = now()
+        WHERE id = $1::uuid
+        RETURNING id::text, sso_subject, username, display_name, email, role,
+                  token_balance, is_active, registered_at, approved_at, last_seen_at,
+                  (password_hash IS NOT NULL) AS has_password, password_updated_at
+        """,
+        row["id"],
+    )
+    return dict(updated) if updated else None
+
+
+async def list_access_users(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    await ensure_access_schema(conn)
+    rows = await conn.fetch(
+        """
+        SELECT id::text, sso_subject, username, display_name, email, role,
+               token_balance, is_active, registered_at, approved_at, last_seen_at,
+               (password_hash IS NOT NULL) AS has_password, password_updated_at
+        FROM access_users
+        ORDER BY
+          CASE role
+            WHEN 'explorer' THEN 1
+            WHEN 'mage' THEN 2
+            WHEN 'sage' THEN 3
+            WHEN 'god' THEN 4
+            ELSE 99
+          END,
+          username
+        """
+    )
+    return [dict(row) for row in rows]
+
+
+async def record_access_activity(
+    conn: asyncpg.Connection,
+    *,
+    user: dict[str, Any] | None,
+    activity: str,
+    dataset_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not user:
+        return None
+    role = normalize_role(user["role"])
+    cost = token_cost(activity, role) if activity in MAGE_TOKEN_COSTS else 0
+    delta = -cost
+    if cost > 0:
+        updated_user = await conn.fetchrow(
+            """
+            UPDATE access_users
+            SET token_balance = token_balance - $2
+            WHERE id = $1::uuid
+              AND token_balance >= $2
+            RETURNING id::text, sso_subject, username, display_name, email, role,
+                      token_balance, is_active, registered_at, approved_at, last_seen_at
+            """,
+            user["id"],
+            cost,
+        )
+        if not updated_user:
+            raise ValueError("Insufficient Mage tokens")
+        user.update(dict(updated_user))
+    row = await conn.fetchrow(
+        """
+        INSERT INTO access_token_ledger (
+          user_id, activity, token_delta, dataset_id, metadata, created_by
+        )
+        VALUES ($1::uuid, $2, $3, $4::uuid, $5::jsonb, $1::uuid)
+        RETURNING id::text, user_id::text, activity, token_delta, dataset_id::text,
+                  metadata, created_at, created_by::text
+        """,
+        user["id"],
+        activity,
+        delta,
+        dataset_id,
+        json.dumps(metadata or {}),
+    )
+    return dict(row)
+
+
+async def list_access_activity(
+    conn: asyncpg.Connection,
+    *,
+    user_id: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    await ensure_access_schema(conn)
+    if user_id:
+        rows = await conn.fetch(
+            """
+            SELECT l.id::text, l.user_id::text, u.username, u.role,
+                   l.activity, l.token_delta, l.dataset_id::text,
+                   l.metadata, l.created_at, l.created_by::text
+            FROM access_token_ledger l
+            JOIN access_users u ON u.id = l.user_id
+            WHERE l.user_id = $1::uuid
+            ORDER BY l.created_at DESC
+            LIMIT $2
+            """,
+            user_id,
+            limit,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT l.id::text, l.user_id::text, u.username, u.role,
+                   l.activity, l.token_delta, l.dataset_id::text,
+                   l.metadata, l.created_at, l.created_by::text
+            FROM access_token_ledger l
+            JOIN access_users u ON u.id = l.user_id
+            ORDER BY l.created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    return [dict(row) for row in rows]

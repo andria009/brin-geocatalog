@@ -5,46 +5,60 @@ import {
   ExternalLink,
   Activity,
   Crosshair,
-  Database,
   FolderOpen,
   Layers,
   List,
+  LogIn,
+  LogOut,
   Map as MapIcon,
   PanelRightClose,
   PanelRightOpen,
   RefreshCw,
   Satellite,
   Search,
+  User,
   X
 } from "lucide-react";
 import maplibregl from "maplibre-gl";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getBoundary,
+  downloadDataset,
+  downloadOdcDataset,
+  getCurrentUser,
   getDatasets,
+  getMyActivity,
   getLocations,
   getPlatforms,
-  getRuns,
   getServices,
   getSourceFiles,
   getStacApiStatus,
+  login,
   type DatasetFilters
 } from "./api";
 import logo from "./assets/geocatalog-logo.png";
 import type {
+  AccessActivity,
   Dataset,
+  AccessUser,
   LocationOptions,
   PlatformStatus,
-  ScanRun,
   ServiceStatus,
   SourceFile
 } from "./types";
 
 type Basemap = "street" | "satellite";
-type RightRailMode = "details" | "datasets" | null;
-type DetailSection = "services" | "platforms" | "runs" | "sources";
+type RightRailMode = "details" | "datasets" | "activity" | null;
+type DetailSection = "services" | "platforms" | "sources";
 const MAX_MAP_RECORDS = 1000;
 const DATASET_PAGE_SIZE = 20;
+const SESSION_STORAGE_KEY = "geocatalog-dev-session";
+
+type Session = {
+  user: AccessUser;
+  headerValue: string;
+  expiresAt: string;
+};
 
 export default function App() {
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -54,13 +68,17 @@ export default function App() {
   const selectAreaModeRef = useRef(false);
   const dragStartRef = useRef<maplibregl.LngLat | null>(null);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [session, setSession] = useState<Session | null>(() => loadSession());
+  const [loginUsername, setLoginUsername] = useState("mage@geocatalog.local");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
   const [mapDatasets, setMapDatasets] = useState<Dataset[]>([]);
   const [totalDatasets, setTotalDatasets] = useState(0);
   const [datasetPage, setDatasetPage] = useState(0);
   const [catalogSearched, setCatalogSearched] = useState(false);
   const [appliedFilters, setAppliedFilters] = useState<DatasetFilters | null>(null);
   const [platforms, setPlatforms] = useState<PlatformStatus[]>([]);
-  const [runs, setRuns] = useState<ScanRun[]>([]);
   const [services, setServices] = useState<ServiceStatus[]>([]);
   const [sources, setSources] = useState<SourceFile[]>([]);
   const [locations, setLocations] = useState<LocationOptions>({
@@ -72,15 +90,19 @@ export default function App() {
   const [selectedBoundary, setSelectedBoundary] = useState<GeoJSON.Feature | null>(null);
   const [basemap, setBasemap] = useState<Basemap>("street");
   const [rightRailMode, setRightRailMode] = useState<RightRailMode>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [detailSections, setDetailSections] = useState<Record<DetailSection, boolean>>({
     services: true,
     platforms: true,
-    runs: true,
     sources: true
   });
   const [selectAreaMode, setSelectAreaMode] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const [assetError, setAssetError] = useState("");
+  const [activities, setActivities] = useState<AccessActivity[]>([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState("");
   const [mapError, setMapError] = useState("");
   const [province, setProvince] = useState("");
   const [kabupaten, setKabupaten] = useState("");
@@ -92,6 +114,8 @@ export default function App() {
     sensor: "",
     dateFrom: "",
     dateTo: "",
+    cloudMin: "",
+    cloudMax: "",
     province: "",
     kabupaten: "",
     kecamatan: ""
@@ -109,6 +133,22 @@ export default function App() {
   const hasDatasetFilter = hasActiveDatasetFilter(filters);
   const tooManyRecords = catalogSearched && totalDatasets >= MAX_MAP_RECORDS;
   const totalDatasetPages = Math.max(1, Math.ceil(totalDatasets / DATASET_PAGE_SIZE));
+  const isAuthenticated = Boolean(session);
+  const cloudMinValue = parseCloudSliderValue(filters.cloudMin, 0);
+  const cloudMaxValue = parseCloudSliderValue(filters.cloudMax, 100);
+
+  useEffect(() => {
+    if (!session?.expiresAt) {
+      return;
+    }
+    const timeoutMs = Date.parse(session.expiresAt) - Date.now();
+    if (timeoutMs <= 0) {
+      logout();
+      return;
+    }
+    const timer = window.setTimeout(() => logout(), timeoutMs);
+    return () => window.clearTimeout(timer);
+  }, [session?.expiresAt]);
 
   useEffect(() => {
     filtersRef.current = filters;
@@ -279,14 +319,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (rightRailMode !== "details" && !runs.some((run) => run.status === "running")) {
+    if (rightRailMode !== "details") {
       return undefined;
     }
     const timer = window.setInterval(() => {
       void refreshOperations();
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [rightRailMode, runs]);
+  }, [rightRailMode]);
 
   useEffect(() => {
     void refreshLocations();
@@ -377,7 +417,7 @@ export default function App() {
     setLoadError("");
     try {
       const [countResponse, operations] = await Promise.all([
-        getDatasets(filters, 1, 0),
+        getDatasets(filters, 1, 0, session?.headerValue),
         fetchOperations()
       ]);
       setTotalDatasets(countResponse.total);
@@ -406,16 +446,24 @@ export default function App() {
       const active = hasActiveDatasetFilter(nextFilters);
       const offset = page * DATASET_PAGE_SIZE;
       const [datasetResponse, operations] = await Promise.all([
-        active ? getDatasets(nextFilters, DATASET_PAGE_SIZE, offset) : getDatasets(nextFilters, 1, 0),
+        active
+          ? getDatasets(nextFilters, DATASET_PAGE_SIZE, offset, session?.headerValue)
+          : getDatasets(nextFilters, 1, 0, session?.headerValue),
         fetchOperations()
       ]);
       setTotalDatasets(datasetResponse.total);
       setDatasetPage(active ? page : 0);
       setDatasets(active ? datasetResponse.items : []);
       applyOperations(operations);
+      if (session) {
+        await refreshCurrentUser(session.headerValue);
+        if (rightRailMode === "activity") {
+          await refreshActivity(session.headerValue);
+        }
+      }
 
       if (active && datasetResponse.total < MAX_MAP_RECORDS) {
-        const mapResponse = await getDatasets(nextFilters, MAX_MAP_RECORDS, 0);
+        const mapResponse = await getDatasets(nextFilters, MAX_MAP_RECORDS, 0, session?.headerValue);
         setMapDatasets(mapResponse.items);
       } else {
         setMapDatasets([]);
@@ -436,16 +484,14 @@ export default function App() {
   }
 
   async function fetchOperations() {
-    const [platformRows, runRows, serviceRows, stacApiStatus, sourceRows] = await Promise.all([
+    const [platformRows, serviceRows, stacApiStatus, sourceRows] = await Promise.all([
       getPlatforms(),
-      getRuns(),
       getServices(),
       getStacApiStatus(),
       getSourceFiles()
     ]);
     return {
       platforms: platformRows,
-      runs: runRows,
       services: [
         {
           service: "frontend",
@@ -463,7 +509,6 @@ export default function App() {
 
   function applyOperations(operations: Awaited<ReturnType<typeof fetchOperations>>) {
     setPlatforms(operations.platforms);
-    setRuns(operations.runs);
     setServices(operations.services);
     setSources(operations.sources);
   }
@@ -497,6 +542,128 @@ export default function App() {
     setFilters({ ...filters, province, kabupaten, kecamatan: value });
   }
 
+  function updateCloudMin(value: string) {
+    const next = Math.min(Number(value), cloudMaxValue);
+    setFilters({ ...filters, cloudMin: next <= 0 ? "" : String(next) });
+  }
+
+  function updateCloudMax(value: string) {
+    const next = Math.max(Number(value), cloudMinValue);
+    setFilters({ ...filters, cloudMax: next >= 100 ? "" : String(next) });
+  }
+
+  async function submitLogin(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLoginBusy(true);
+    setLoginError("");
+    try {
+      const response = await login(loginUsername, loginPassword);
+      const nextSession = {
+        user: response.user,
+        headerValue: response.development_header.value,
+        expiresAt: response.expires_at
+      };
+      setSession(nextSession);
+      window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(nextSession));
+      setLoginPassword("");
+      setRightRailMode(null);
+      mapRef.current?.resize();
+      window.setTimeout(() => mapRef.current?.resize(), 150);
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message : "Login failed.");
+    } finally {
+      setLoginBusy(false);
+    }
+  }
+
+  function logout() {
+    setSession(null);
+    window.localStorage.removeItem(SESSION_STORAGE_KEY);
+    setDatasets([]);
+    setMapDatasets([]);
+    setActivities([]);
+    setSelected(null);
+    setRightRailMode(null);
+    setCatalogSearched(false);
+    window.setTimeout(() => mapRef.current?.resize(), 150);
+  }
+
+  async function refreshCurrentUser(accessUser = session?.headerValue) {
+    if (!accessUser) {
+      return;
+    }
+    try {
+      const user = await getCurrentUser(accessUser);
+      const nextSession = { user, headerValue: accessUser, expiresAt: session?.expiresAt ?? "" };
+      setSession(nextSession);
+      window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(nextSession));
+    } catch {
+      // Keep the current session if a lightweight refresh fails.
+    }
+  }
+
+  async function openActivityRail() {
+    if (rightRailMode === "activity") {
+      setRightRailMode(null);
+      return;
+    }
+    setRightRailMode("activity");
+    await refreshActivity();
+  }
+
+  async function refreshActivity(accessUser = session?.headerValue) {
+    if (!accessUser) {
+      return;
+    }
+    setActivityLoading(true);
+    setActivityError("");
+    try {
+      setActivities(await getMyActivity(accessUser));
+      await refreshCurrentUser(accessUser);
+    } catch (error) {
+      setActivityError(error instanceof Error ? error.message : "Activity data failed to load.");
+    } finally {
+      setActivityLoading(false);
+    }
+  }
+
+  async function handleDownloadDataset(dataset: Dataset) {
+    if (!session) {
+      return;
+    }
+    setAssetError("");
+    try {
+      await downloadDataset(dataset, session.headerValue);
+      await refreshCurrentUser(session.headerValue);
+      if (rightRailMode === "activity") {
+        await refreshActivity(session.headerValue);
+      }
+    } catch (error) {
+      setAssetError(error instanceof Error ? error.message : "Download failed.");
+    }
+  }
+
+  async function handleDownloadOdc(dataset: Dataset) {
+    if (!session) {
+      return;
+    }
+    setAssetError("");
+    try {
+      await downloadOdcDataset(dataset, session.headerValue);
+      await refreshCurrentUser(session.headerValue);
+      if (rightRailMode === "activity") {
+        await refreshActivity(session.headerValue);
+      }
+    } catch (error) {
+      setAssetError(error instanceof Error ? error.message : "ODC export failed.");
+    }
+  }
+
+  function toggleSidebar() {
+    setSidebarCollapsed((current) => !current);
+    window.setTimeout(() => mapRef.current?.resize(), 150);
+  }
+
   function fitFeature(feature: GeoJSON.Feature) {
     const bounds = new maplibregl.LngLatBounds();
     visitCoordinates(feature.geometry, (coordinate) => bounds.extend(coordinate as [number, number]));
@@ -519,13 +686,42 @@ export default function App() {
   }
 
   return (
-    <main className={`app-shell ${rightRailMode ? "" : "rail-collapsed"}`}>
-      <aside className="sidebar">
-        <div className="brand">
+    <main
+      className={`${isAuthenticated ? "app-shell" : "landing-shell"} ${
+        rightRailMode ? "" : "rail-collapsed"
+      } ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
+    >
+      {isAuthenticated ? (
+      <aside className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
+        <button className="brand brand-toggle" onClick={toggleSidebar} title="Toggle sidebar">
           <img className="brand-logo" src={logo} alt="GeoCatalog" />
+          {!sidebarCollapsed ? (
           <div>
             <p>geocatalog</p>
             <span>Multi-Satellite Data Aquisition and Cataloging Platform</span>
+          </div>
+          ) : null}
+        </button>
+        {!sidebarCollapsed ? (
+        <>
+        <div className="sidebar-session">
+          <div className="session-identity">
+            <User size={15} />
+            <span>{session?.user.role}</span>
+            {session?.user.role === "mage" ? <strong>{formatNumber(session.user.token_balance)} tokens</strong> : null}
+          </div>
+          <div className="session-actions">
+            <button
+              className={`session-icon-button ${rightRailMode === "activity" ? "active" : ""}`}
+              onClick={() => void openActivityRail()}
+              title={rightRailMode === "activity" ? "Hide activity" : "Show activity"}
+              aria-label={rightRailMode === "activity" ? "Hide activity" : "Show activity"}
+            >
+              <Activity size={14} />
+            </button>
+            <button onClick={logout}>
+              <LogOut size={14} /> Logout
+            </button>
           </div>
         </div>
 
@@ -600,6 +796,41 @@ export default function App() {
                 </label>
               </div>
             </div>
+            <div className="date-filter">
+              <span>Cloud cover (%)</span>
+              <div className="range-summary">
+                <span>{cloudMinValue}%</span>
+                <span>{cloudMaxValue}%</span>
+              </div>
+              <div className="dual-range" aria-label="Cloud cover range">
+                <div
+                  className="dual-range-active"
+                  style={{ left: `${cloudMinValue}%`, right: `${100 - cloudMaxValue}%` }}
+                />
+                <label>
+                  <span>Minimum cloud cover</span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value={cloudMinValue}
+                    onChange={(event) => updateCloudMin(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Maximum cloud cover</span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value={cloudMaxValue}
+                    onChange={(event) => updateCloudMax(event.target.value)}
+                  />
+                </label>
+              </div>
+            </div>
             <label>
               Provinsi
               <input
@@ -653,9 +884,49 @@ export default function App() {
             </button>
           </div>
         </section>
+        </>
+        ) : null}
       </aside>
+      ) : null}
 
       <section className="map-stage">
+        {!isAuthenticated ? (
+          <>
+            <LandingStatus platforms={platforms} totalDatasets={totalDatasets} />
+            <div className="landing-logo">
+              <img src={logo} alt="GeoCatalog" />
+            </div>
+            <form className="login-card" onSubmit={(event) => void submitLogin(event)}>
+              <div className="login-title">
+                <LogIn size={16} />
+                <span>Login</span>
+              </div>
+              <label>
+                Username
+                <input
+                  value={loginUsername}
+                  onChange={(event) => setLoginUsername(event.target.value)}
+                  autoComplete="username"
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  value={loginPassword}
+                  onChange={(event) => setLoginPassword(event.target.value)}
+                  autoComplete="current-password"
+                  placeholder="Sample password"
+                />
+              </label>
+              {loginError ? <div className="login-error">{loginError}</div> : null}
+              <button className="primary-button" disabled={loginBusy}>
+                <LogIn size={15} /> {loginBusy ? "Signing in" : "Enter Catalog"}
+              </button>
+            </form>
+          </>
+        ) : null}
+        {isAuthenticated ? (
         <div className="map-toolbar">
           <div className="toolbar-count">
             <strong>{formatNumber(totalDatasets)}</strong>
@@ -705,7 +976,8 @@ export default function App() {
             GeoJSON
           </button>
         </div>
-        {!catalogSearched ? (
+        ) : null}
+        {isAuthenticated && !catalogSearched ? (
           <div className="map-notice">
             <strong>Make a filter to show footprints</strong>
             <span>
@@ -714,7 +986,7 @@ export default function App() {
             </span>
           </div>
         ) : null}
-        {catalogSearched && !hasDatasetFilter ? (
+        {isAuthenticated && catalogSearched && !hasDatasetFilter ? (
           <div className="map-notice">
             <strong>Add a filter and refresh</strong>
             <span>
@@ -723,7 +995,7 @@ export default function App() {
             </span>
           </div>
         ) : null}
-        {tooManyRecords ? (
+        {isAuthenticated && tooManyRecords ? (
           <div className="map-notice">
             <strong>{formatNumber(totalDatasets)} matching records</strong>
             <span>
@@ -732,7 +1004,7 @@ export default function App() {
             </span>
           </div>
         ) : null}
-        {catalogSearched && hasDatasetFilter && totalDatasets > 0 && loadedFootprintCount === 0 && !tooManyRecords ? (
+        {isAuthenticated && catalogSearched && hasDatasetFilter && totalDatasets > 0 && loadedFootprintCount === 0 && !tooManyRecords ? (
           <div className="map-notice">
             <strong>{formatNumber(totalDatasets)} matching catalog records</strong>
             <span>
@@ -741,7 +1013,7 @@ export default function App() {
             </span>
           </div>
         ) : null}
-        {catalogSearched && hasDatasetFilter && totalDatasets === 0 ? (
+        {isAuthenticated && catalogSearched && hasDatasetFilter && totalDatasets === 0 ? (
           <div className="map-notice">
             <strong>No footprint-matched records</strong>
             <span>
@@ -768,17 +1040,26 @@ export default function App() {
             <span>{loadError}</span>
           </div>
         ) : null}
-        {selectAreaMode ? (
+        {isAuthenticated && selectAreaMode ? (
           <div className="map-hint">
             <strong>Select Area</strong>
             <span>Drag a bounding box on the map.</span>
           </div>
         ) : null}
-        {selected ? <DatasetInspector selected={selected} onClose={() => setSelected(null)} /> : null}
+        {isAuthenticated && selected ? (
+          <DatasetInspector
+            selected={selected}
+            user={session?.user ?? null}
+            assetError={assetError}
+            onClose={() => setSelected(null)}
+            onDownload={() => void handleDownloadDataset(selected)}
+            onDownloadOdc={() => void handleDownloadOdc(selected)}
+          />
+        ) : null}
         <div className="map" ref={mapNodeRef} />
       </section>
 
-      {rightRailMode === "details" ? (
+      {isAuthenticated && rightRailMode === "details" ? (
       <aside className="right-rail">
         <section className="panel">
           <button className="panel-title collapsible-title" onClick={() => toggleDetailSection("platforms")}>
@@ -791,36 +1072,6 @@ export default function App() {
                 <div key={item.platform} className="status-row">
                   <span>{item.platform}</span>
                   <strong>{formatNumber(item.total)}</strong>
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </section>
-
-        <section className="panel">
-          <button className="panel-title collapsible-title" onClick={() => toggleDetailSection("runs")}>
-            <span><Database size={16} /> Recent Runs</span>
-            {detailSections.runs ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-          </button>
-          {detailSections.runs ? (
-            <div className="run-list">
-              {runs.slice(0, 3).map((run) => (
-                <div key={run.id} className="run-row">
-                  <div className="run-heading">
-                    <strong>{formatDateTime(run.started_at)}</strong>
-                    <span className={`service-pill service-pill-${statusTone(run.status)}`}>
-                      {run.status}
-                    </span>
-                  </div>
-                  <span>{run.root_path}</span>
-                  <small>
-                    {formatNumber(run.scanned_files)} scanned, {formatNumber(run.indexed_files)} new,{" "}
-                    {formatNumber(run.updated_files)} updated, {formatNumber(run.unchanged_files)} unchanged,{" "}
-                    {formatNumber(run.removed_files)} removed, {formatNumber(run.skipped_files)} skipped
-                  </small>
-                  <div className={`run-meter ${run.status === "running" ? "active" : ""}`}>
-                    <span />
-                  </div>
                 </div>
               ))}
             </div>
@@ -869,7 +1120,7 @@ export default function App() {
 
       </aside>
       ) : null}
-      {rightRailMode === "datasets" ? (
+      {isAuthenticated && rightRailMode === "datasets" ? (
         <aside className="right-rail datasets-rail">
           <section className="panel">
             <div className="panel-title">
@@ -928,11 +1179,71 @@ export default function App() {
           </section>
         </aside>
       ) : null}
+      {isAuthenticated && rightRailMode === "activity" ? (
+        <aside className="right-rail activity-rail">
+          <section className="panel">
+            <div className="panel-title">
+              <Activity size={16} /> My Activity
+            </div>
+            <p className="rail-summary">
+              {session?.user.role === "mage"
+                ? `Token balance: ${formatNumber(session.user.token_balance)}`
+                : "Recent actions for your account."}
+            </p>
+            <button
+              className="rail-refresh-button"
+              onClick={() => void refreshActivity()}
+              disabled={activityLoading}
+            >
+              <RefreshCw size={14} /> {activityLoading ? "Refreshing" : "Refresh Activity"}
+            </button>
+            {activityError ? <div className="asset-error">{activityError}</div> : null}
+            <div className="activity-list">
+              {activities.length ? (
+                activities.map((item) => (
+                  <div key={item.id} className="activity-row">
+                    <div>
+                      <strong>{formatActivityLabel(item.activity)}</strong>
+                      <span>{formatActivityMetadata(item)}</span>
+                      <small>{formatDateTime(item.created_at)}</small>
+                    </div>
+                    {item.token_delta !== 0 ? (
+                      <span className={item.token_delta < 0 ? "token-charge" : "token-credit"}>
+                        {item.token_delta > 0 ? "+" : ""}
+                        {formatNumber(item.token_delta)}
+                      </span>
+                    ) : null}
+                  </div>
+                ))
+              ) : (
+                <p className="empty-note">
+                  {activityLoading ? "Loading activity..." : "No activity has been recorded yet."}
+                </p>
+              )}
+            </div>
+          </section>
+        </aside>
+      ) : null}
     </main>
   );
 }
 
-function DatasetInspector({ selected, onClose }: { selected: Dataset; onClose: () => void }) {
+function DatasetInspector({
+  selected,
+  user,
+  assetError,
+  onClose,
+  onDownload,
+  onDownloadOdc
+}: {
+  selected: Dataset;
+  user: AccessUser | null;
+  assetError: string;
+  onClose: () => void;
+  onDownload: () => void;
+  onDownloadOdc: () => void;
+}) {
+  const canAccessAssets = Boolean(user?.policy.can_access_assets);
   return (
     <section className="dataset-inspector">
       <div className="inspector-title">
@@ -947,10 +1258,10 @@ function DatasetInspector({ selected, onClose }: { selected: Dataset; onClose: (
         <strong>{selected.title}</strong>
         <span>{selected.source_path}</span>
         <div className="action-row">
-          <button disabled>
+          <button disabled={!canAccessAssets} onClick={onDownload} title={canAccessAssets ? "Costs 10 Mage tokens" : "Asset access is not available for this role"}>
             <Download size={14} /> Download
           </button>
-          <button disabled>
+          <button disabled={!canAccessAssets} onClick={onDownloadOdc} title={canAccessAssets ? "Costs 5 Mage tokens" : "Asset access is not available for this role"}>
             <ExternalLink size={14} /> ODC
           </button>
           <a
@@ -961,6 +1272,7 @@ function DatasetInspector({ selected, onClose }: { selected: Dataset; onClose: (
             <ExternalLink size={14} /> STAC
           </a>
         </div>
+        {assetError ? <div className="asset-error">{assetError}</div> : null}
         <dl>
           <dt>Collection</dt>
           <dd>{selected.collection_id}</dd>
@@ -976,12 +1288,62 @@ function DatasetInspector({ selected, onClose }: { selected: Dataset; onClose: (
           <dd>{formatDateTime(selected.acquisition_start)}</dd>
           <dt>Modified</dt>
           <dd>{formatDateTime(selected.modified_at)}</dd>
+          <dt>Cloud coverage</dt>
+          <dd>{formatCloudCover(selected.properties)}</dd>
           <dt>BBox</dt>
           <dd>{selected.bbox ? selected.bbox.map((value) => value.toFixed(4)).join(", ") : "-"}</dd>
         </dl>
       </div>
     </section>
   );
+}
+
+function LandingStatus({
+  platforms,
+  totalDatasets
+}: {
+  platforms: PlatformStatus[];
+  totalDatasets: number;
+}) {
+  return (
+    <section className="landing-status">
+      <div className="panel-title">
+        <Activity size={16} /> Status by Platform
+      </div>
+      <div className="landing-total">
+        <strong>{formatNumber(totalDatasets)}</strong>
+        <span>indexed records</span>
+      </div>
+      <div className="status-list">
+        {platforms.slice(0, 8).map((item) => (
+          <div key={item.platform} className="status-row">
+            <span>{item.platform}</span>
+            <strong>{formatNumber(item.total)}</strong>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function loadSession(): Session | null {
+  try {
+    const raw = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Session;
+    if (!parsed?.headerValue || !parsed?.user?.username || !parsed?.expiresAt) {
+      return null;
+    }
+    if (Date.parse(parsed.expiresAt) <= Date.now()) {
+      window.localStorage.removeItem(SESSION_STORAGE_KEY);
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 function emptyCollection(): GeoJSON.FeatureCollection {
@@ -1071,6 +1433,90 @@ function formatNumber(value: number | null | undefined) {
   return Number(value ?? 0).toLocaleString();
 }
 
+function formatCloudCover(properties: Record<string, unknown>) {
+  const value = readNumericProperty(properties.cloud_cover);
+  if (value === null) {
+    return "Not available";
+  }
+  const landValue = readNumericProperty(properties.cloud_cover_land);
+  const land = landValue !== null ? `, land ${landValue.toFixed(1)}%` : "";
+  const method = formatCloudMethod(properties.cloud_method);
+  return `${value.toFixed(1)}%${land}${method}`;
+}
+
+function readNumericProperty(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function formatCloudMethod(value: unknown) {
+  if (value === "landsat_mtl") {
+    return " (Landsat metadata)";
+  }
+  if (value === "sentinel2_mtd") {
+    return " (Sentinel-2 metadata)";
+  }
+  if (value === "estimated_rgb") {
+    return " (estimated from RGB)";
+  }
+  return typeof value === "string" && value ? ` (${value})` : "";
+}
+
+function parseCloudSliderValue(value: string, fallback: number) {
+  if (!value.trim()) {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(100, Math.max(0, parsed));
+}
+
+function formatActivityLabel(activity: AccessActivity["activity"]) {
+  if (activity === "search") {
+    return "Search/filter";
+  }
+  if (activity === "download") {
+    return "Download asset";
+  }
+  if (activity === "odc_asset") {
+    return "ODC access";
+  }
+  if (activity === "stac_asset") {
+    return "STAC access";
+  }
+  if (activity === "admin_adjustment") {
+    return "Token adjustment";
+  }
+  return activity;
+}
+
+function formatActivityMetadata(item: AccessActivity) {
+  const fileName = item.metadata.file_name;
+  if (typeof fileName === "string" && fileName) {
+    return fileName;
+  }
+  if (item.activity === "search") {
+    const total = typeof item.metadata.total === "number" ? item.metadata.total : null;
+    const platform = typeof item.metadata.platform === "string" ? item.metadata.platform : "";
+    const q = typeof item.metadata.q === "string" ? item.metadata.q : "";
+    const parts = [
+      total !== null ? `${formatNumber(total)} matching records` : "Catalog search",
+      platform ? `platform ${platform}` : "",
+      q ? `text ${q}` : ""
+    ].filter(Boolean);
+    return parts.join(" / ");
+  }
+  return item.dataset_id ?? "Account activity";
+}
+
 function hasActiveDatasetFilter(filters: DatasetFilters) {
   return Boolean(
     filters.q.trim() ||
@@ -1079,6 +1525,8 @@ function hasActiveDatasetFilter(filters: DatasetFilters) {
       filters.sensor.trim() ||
       filters.dateFrom.trim() ||
       filters.dateTo.trim() ||
+      filters.cloudMin.trim() ||
+      filters.cloudMax.trim() ||
       filters.province.trim() ||
       filters.kabupaten.trim() ||
       filters.kecamatan.trim() ||

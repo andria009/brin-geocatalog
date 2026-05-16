@@ -18,8 +18,15 @@ class Settings(BaseSettings):
     pgstac_password: str = "pgstac_dev"
 
     # Base URL that the stac sync worker will embed in STAC asset hrefs.
-    # Must be the publicly reachable address of the geocatalog API.
-    api_base_url: str = "http://localhost:8010"
+    # Must be the publicly reachable nginx/frontend address because large
+    # downloads are fulfilled with X-Accel-Redirect.
+    api_base_url: str = "http://localhost:8090"
+
+    # Comma-separated mounted roots from which the API is allowed to stream assets.
+    asset_roots: str = "/data/geomimo"
+    download_ticket_secret: str = "geocatalog-dev-download-ticket-secret"
+    download_ticket_ttl_seconds: int = 300
+    access_session_timeout_days: int = 3
 
     model_config = SettingsConfigDict(env_prefix="GEOCATALOG_", env_file=".env", extra="ignore")
 
@@ -36,6 +43,10 @@ class Settings(BaseSettings):
             f"postgresql://{self.pgstac_user}:{self.pgstac_password}"
             f"@{self.pgstac_host}:{self.pgstac_port}/{self.pgstac_name}"
         )
+
+    @property
+    def asset_root_paths(self) -> list[str]:
+        return [root.strip() for root in self.asset_roots.split(",") if root.strip()]
 
 
 @lru_cache

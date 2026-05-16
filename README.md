@@ -25,6 +25,7 @@ The catalog discovers files, extracts available metadata, indexes footprints and
 - Spatial footprint extraction for supported raster files, with continuous backfill support.
 - Indonesian administrative boundary enrichment for province, kabupaten/kota, and kecamatan filters.
 - Read-only catalog API for datasets, scan runs, service status, source files, administrative boundaries, and ODC-style metadata.
+- Access policy foundation for SSO-linked users, local role mapping, Mage token accounting, and protected asset access.
 - Production STAC API served by stac-fastapi-pgstac + PgSTAC, populated by the incremental STAC sync service.
 - Frontend map visualization with OpenStreetMap and ESRI World Imagery basemaps.
 
@@ -60,6 +61,8 @@ Operational notes:
 - `worker-service`, `footprint-backfill-service`, and `stac-sync-service` are optional long-running services enabled through `--profile service`.
 - `worker` is a manual utility container enabled through `--profile tools`.
 - `api` mounts `./logs:/app/logs:ro` so `/api/v1/services` can report the latest STAC sync checkpoint written by `stac-sync-service`.
+- `api` mounts `${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}` at `/data/geomimo:ro` and only streams assets from `GEOCATALOG_ASSET_ROOTS`.
+- `frontend` also mounts `${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}` at `/data/geomimo:ro` so nginx can serve protected large-file downloads with `X-Accel-Redirect`.
 - Log timestamps are emitted in UTC (`+00:00`). Indonesia WIB is UTC+7.
 
 ## Technology Stack
@@ -144,6 +147,8 @@ PostgreSQL runs this file automatically only when the `geocatalog-postgres-data`
 - `scan_runs`
 - `scan_checkpoints`
 - `admin_boundaries`
+- `access_users`
+- `access_token_ledger`
 - Search, temporal, collection, and spatial indexes.
 
 The schema file includes idempotent `CREATE ... IF NOT EXISTS` and selected `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements. This helps fresh installs and some incremental upgrades, but it is not yet a full migration framework for already-running production databases.
@@ -352,6 +357,11 @@ The STAC API is served by stac-fastapi-pgstac and exposed through the nginx fron
 - `GET /api/v1/health`
 - `GET /api/v1/status`
 - `GET /api/v1/services`
+- `GET /api/v1/access/roles`
+- `GET /api/v1/access/users`
+- `GET /api/v1/access/me`
+- `GET /api/v1/access/activity`
+- `POST /api/v1/access/login`
 - `GET /api/v1/platforms`
 - `GET /api/v1/scan-runs`
 - `GET /api/v1/source-files`
@@ -365,6 +375,155 @@ The STAC API is served by stac-fastapi-pgstac and exposed through the nginx fron
 
 `/api/v1/services` is a lightweight operational endpoint used by the frontend detail rail. It reports frontend/API reachability, catalog database status, latest worker progress, STAC sync checkpoint status, and footprint-backfill availability.
 
+Dataset search supports optional cloud-cover filtering:
+
+```bash
+curl "http://localhost:8010/api/v1/datasets?platform=landsat-8&cloud_max=20&limit=20"
+```
+
+Cloud cover is read from source metadata when available and stored in dataset `properties`:
+
+- Landsat `*_MTL.txt`: `CLOUD_COVER` and `CLOUD_COVER_LAND`.
+- Sentinel-2 `MTD_*.xml`: `Cloud_Coverage_Assessment`.
+- RGB-only derived products without sidecar metadata are not cloud-estimated yet.
+
+## Access Management
+
+GeoCatalog will use SSO for authentication and local GeoCatalog records for authorization.
+
+The SSO service identifies the user. GeoCatalog stores that SSO identity in `access_users.sso_subject`, then assigns a local role and optional Mage token balance.
+
+Role order from lowest to highest access:
+
+```text
+explorer < mage < sage < god
+```
+
+Current role policy:
+
+| Role | Access |
+|---|---|
+| `explorer` | Can use filters, view the Dataset rail, view Dataset information, and see only Status by Platform in the Detail rail. Cannot access/download assets. |
+| `mage` | Can use all filters, view full Detail rail, view Dataset rail and Dataset information, and access assets through metered tokens. Starts with 5000 tokens by policy. |
+| `sage` | Can use all filters, view full Detail rail, view Dataset rail and Dataset information, and access assets without token metering. |
+| `god` | Full system access. Future work: approve registrations, assign roles, update Mage token balances, and start/stop services from the UI. |
+
+Mage token costs:
+
+| Activity | Cost |
+|---|---:|
+| Search/filter | 1 |
+| Download asset file | 10 |
+| Access asset through STAC | 5 |
+| Access asset through ODC | 5 |
+
+The initial access policy is exposed at:
+
+```bash
+curl http://localhost:8010/api/v1/access/roles
+```
+
+Before BRIN SSO is integrated, local development users can be created with:
+
+```bash
+docker compose run --rm worker geocatalog access seed-dev-users
+```
+
+The command creates sample users and resets their sample passwords:
+
+| Username | Password | Role |
+|---|---|---|
+| `explorer@geocatalog.local` | `Explorer123!` | `explorer` |
+| `mage@geocatalog.local` | `Mage123!` | `mage` |
+| `sage@geocatalog.local` | `Sage123!` | `sage` |
+| `god@geocatalog.local` | `God123!` | `god` |
+
+Temporary local login is available for pre-SSO testing:
+
+```bash
+curl -X POST "http://localhost:8010/api/v1/access/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"mage@geocatalog.local","password":"Mage123!"}'
+```
+
+The login response returns the development header value to use for API requests, plus `expires_at`. The frontend stores this local session and automatically logs the user out when it expires.
+
+The default session lifetime is 3 days and can be changed with:
+
+```bash
+GEOCATALOG_ACCESS_SESSION_TIMEOUT_DAYS=3
+```
+
+Use one of those usernames in the `X-GeoCatalog-User` header to test access behavior:
+
+```bash
+curl -H "X-GeoCatalog-User: mage@geocatalog.local" \
+  "http://localhost:8010/api/v1/access/me"
+
+curl -H "X-GeoCatalog-User: god@geocatalog.local" \
+  "http://localhost:8010/api/v1/access/users"
+
+curl -H "X-GeoCatalog-User: mage@geocatalog.local" \
+  "http://localhost:8010/api/v1/datasets?platform=landsat-8&limit=5"
+
+curl -H "X-GeoCatalog-User: god@geocatalog.local" \
+  "http://localhost:8010/api/v1/access/activity?limit=20"
+```
+
+Development access behavior currently enforced by the API:
+
+- Missing user headers behave like unauthenticated explorer access; unknown user headers return `401`.
+- Listing users and all-user activity requires a God user header.
+- Explorer cannot access asset endpoints.
+- Mage can access asset endpoints only while tokens are available.
+- Search/filter requests with a dev user header write activity ledger entries.
+- Sage and God write activity ledger entries without token deductions.
+
+SSO login and registration approval workflows are still pending; the current header-based user selection is only for pre-SSO testing.
+
+### Protected Asset Access
+
+Dataset assets are exposed through the catalog API instead of direct filesystem paths:
+
+```text
+GET /api/v1/datasets/{dataset_id}/download-ticket
+GET /api/v1/datasets/{dataset_id}/download
+GET /api/v1/datasets/{dataset_id}/odc
+```
+
+Both endpoints require a known GeoCatalog user. In pre-SSO development mode, pass the username in `X-GeoCatalog-User`.
+
+```bash
+curl -H "X-GeoCatalog-User: mage@geocatalog.local" \
+  -O "http://localhost:8090/api/v1/datasets/<dataset-id>/download"
+
+curl -H "X-GeoCatalog-User: sage@geocatalog.local" \
+  "http://localhost:8010/api/v1/datasets/<dataset-id>/odc"
+```
+
+Large downloads use nginx `X-Accel-Redirect`. The API validates the user, role, token balance, and source path, then returns an internal redirect. nginx serves the file from `/data/geomimo` directly, which avoids streaming large assets through FastAPI.
+
+The frontend Download button first requests a short-lived download ticket, then opens the ticketed download URL in the browser. This avoids custom request headers on the large file transfer and lets nginx handle the actual bytes.
+
+Use the frontend/nginx port (`8090` by default) for download requests. Direct API calls to port `8010` can verify authorization and headers, but only nginx interprets `X-Accel-Redirect` and transfers the file bytes.
+
+The API validates that the source file resolves under `GEOCATALOG_ASSET_ROOTS` before granting the redirect. The default allowed root is `/data/geomimo`, mounted read-only from `${GEOCATALOG_SCAN_ROOT:-/mnt/geomimo-data}` in Docker Compose.
+
+Set a production secret for ticket signing:
+
+```bash
+GEOCATALOG_DOWNLOAD_TICKET_SECRET=replace-with-a-long-random-secret
+GEOCATALOG_DOWNLOAD_TICKET_TTL_SECONDS=300
+```
+
+STAC asset hrefs generated by `stac-sync-service` also point to the protected download endpoint. Existing PgSTAC records can be refreshed with:
+
+```bash
+docker compose run --rm worker geocatalog stac sync
+```
+
+Set `GEOCATALOG_API_BASE_URL` to the externally reachable frontend/nginx URL, for example `http://10.28.12.102:8090`, before running STAC sync. This keeps STAC asset links on the nginx path that can serve large files.
+
 ## Frontend
 
 The web frontend is available at `http://localhost:8090`.
@@ -373,21 +532,19 @@ Current features:
 
 - Indonesia-centered MapLibre map.
 - OpenStreetMap street basemap and ESRI World Imagery satellite basemap.
-- Sidebar filters ordered as text, platform, type/sensor, date, province, kabupaten/kota, and kecamatan.
+- Sidebar filters ordered as text, platform, type/sensor, date, cloud cover, province, kabupaten/kota, and kecamatan.
 - Text filter supports normal full-text search and wildcard search. Use `*` for any characters and `?` for one character, for example `LC08*QA*` or `a1.210??.*`.
 - Area selection from the map by drawing a bounding box.
 - Dataset rail paginated at 20 records per page.
-- Detail rail with collapsible sections ordered as Status by Platform, Recent Runs, Service Status, and Source Files.
+- Detail rail with collapsible sections ordered as Status by Platform, Service Status, and Source Files.
 - Source Files section shows the latest 5 processed files.
-- Selected Dataset inspector shows source path, collection, platform, sensor, file size, acquisition/modified times, bbox, and STAC link.
+- Selected Dataset inspector shows source path, collection, platform, sensor, file size, acquisition/modified times, cloud cover when available, bbox, STAC link, and role-aware asset actions.
 
 Temporarily disabled frontend actions:
 
 - Map GeoJSON download button.
-- Selected Dataset Download button.
-- Selected Dataset ODC button.
 
-The REST endpoints for dataset download and ODC metadata still exist, but the frontend buttons are disabled until asset access and ODC workflow details are finalized.
+Selected Dataset Download and ODC buttons are enabled for Mage, Sage, and God users. Explorer users can inspect metadata but cannot access assets. Mage usage is deducted from the token ledger.
 
 ## STAC API
 

@@ -1,7 +1,17 @@
 from datetime import UTC, datetime
+from pathlib import Path
 
-from geocatalog.api import create_app, parse_query_datetime, serialize_dataset, to_odc_dataset
-from geocatalog.repository import wildcard_to_ilike_pattern
+from geocatalog.api import (
+    asset_accel_redirect_path,
+    content_disposition,
+    create_download_ticket,
+    create_app,
+    parse_query_datetime,
+    serialize_dataset,
+    to_odc_dataset,
+    verify_download_ticket,
+)
+from geocatalog.repository import add_cloud_cover_filter, wildcard_to_ilike_pattern
 from geocatalog.stac_sync import stac_item_id_for_dataset
 
 
@@ -32,6 +42,8 @@ def test_catalog_api_does_not_register_transitional_stac_routes():
     app = create_app()
 
     assert any(route.path == "/api/v1/health" for route in app.routes)
+    assert any(route.path == "/api/v1/access/roles" for route in app.routes)
+    assert any(route.path == "/api/v1/access/login" for route in app.routes)
     assert not any(route.path.startswith("/stac") for route in app.routes)
 
 
@@ -88,6 +100,35 @@ def test_wildcard_search_pattern_uses_sql_wildcards_and_escapes_literals():
     assert wildcard_to_ilike_pattern("100%_ready~*") == "100~%~_ready~~%"
 
 
+def test_cloud_cover_filter_full_range_does_not_exclude_missing_metadata():
+    clauses = []
+    args = []
+
+    def add(value):
+        args.append(value)
+        return f"${len(args)}"
+
+    add_cloud_cover_filter(clauses, add, 0, 100)
+
+    assert clauses == []
+    assert args == []
+
+
+def test_cloud_cover_filter_partial_range_requires_cloud_metadata():
+    clauses = []
+    args = []
+
+    def add(value):
+        args.append(value)
+        return f"${len(args)}"
+
+    add_cloud_cover_filter(clauses, add, 0, 30)
+
+    assert "properties ? 'cloud_cover'" in clauses
+    assert "(properties->>'cloud_cover')::double precision <= $1" in clauses
+    assert args == [30]
+
+
 def test_to_odc_dataset_uses_catalog_metadata():
     row = dataset_row()
 
@@ -98,3 +139,22 @@ def test_to_odc_dataset_uses_catalog_metadata():
     assert odc["properties"]["platform"] == "landsat-8"
     assert odc["properties"]["instrument"] == "oli-tirs"
     assert odc["measurements"]["data"]["path"] == row["source_path"]
+
+
+def test_asset_accel_redirect_path_is_internal_and_url_encoded():
+    path = Path("/data/geomimo/folder with spaces/LC08_B1.TIF")
+
+    assert asset_accel_redirect_path(path) == "/protected-assets/folder%20with%20spaces/LC08_B1.TIF"
+
+
+def test_content_disposition_includes_ascii_fallback_and_utf8_filename():
+    header = content_disposition("scene ä.tif")
+
+    assert 'filename="scene _.tif"' in header
+    assert "filename*=UTF-8''scene%20%C3%A4.tif" in header
+
+
+def test_download_ticket_round_trip_identifies_user_subject():
+    ticket = create_download_ticket("dataset-1", "mage@geocatalog.local")
+
+    assert verify_download_ticket(ticket, "dataset-1") == "mage@geocatalog.local"
