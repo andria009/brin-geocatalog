@@ -36,7 +36,7 @@ import {
   login,
   type DatasetFilters
 } from "./api";
-import logo from "./assets/geocatalog-logo.png";
+import logo from "./assets/geocatalog-icon.png";
 import type {
   AccessActivity,
   Dataset,
@@ -1063,7 +1063,7 @@ export default function App() {
       <aside className="right-rail">
         <section className="panel">
           <button className="panel-title collapsible-title" onClick={() => toggleDetailSection("platforms")}>
-            <span><Activity size={16} /> Status by Platform</span>
+            <span><Layers size={16} /> Status by Platform</span>
             {detailSections.platforms ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
           </button>
           {detailSections.platforms ? (
@@ -1308,7 +1308,7 @@ function LandingStatus({
   return (
     <section className="landing-status">
       <div className="panel-title">
-        <Activity size={16} /> Status by Platform
+        <Layers size={16} /> Status by Platform
       </div>
       <div className="landing-total">
         <strong>{formatNumber(totalDatasets)}</strong>
